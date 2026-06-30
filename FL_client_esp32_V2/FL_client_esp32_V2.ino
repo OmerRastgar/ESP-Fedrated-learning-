@@ -15,12 +15,25 @@
  *     server unreachable on boot
  *   - Inference calls infer() which returns argmax class index + name string
  *
+ * ── TinyML addition (inference-only, training is UNCHANGED) ──────────────────
+ *   On FL convergence the server converts final weights to an int8 .tflite
+ *   model. This client downloads it, verifies its SHA256 hash against the
+ *   server before trusting it, and during the inference phase runs BOTH:
+ *     (a) the existing hand-written float32 forward pass, and
+ *     (b) a TensorFlow Lite Micro (TFLM) interpreter on the same sample
+ *   Latency, memory footprint, and confidence are logged for both and
+ *   periodically uploaded to the server as a benchmark report.
+ *
  * Server-managed round lifecycle (clients poll /status):
- *   wait      → stay idle, poll again after POLL_INTERVAL_MS
- *   train     → download model, train all 4 classes, upload weights
- *   inference → load final weights, verify hash, run forward pass locally
+ *   wait            → stay idle, poll again after POLL_INTERVAL_MS
+ *   train           → download model, train all 4 classes, upload weights  [UNCHANGED]
+ *   download_model  → download .tflite + verify hash before inference starts [NEW]
+ *   inference       → run dual inference (hand-written + TFLM), benchmark
  *
  * Change WIFI_SSID, WIFI_PASS, SERVER_IP, CLIENT_ID before flashing each node.
+ *
+ * Library requirement: install "Chirale_TensorFlowLite" or the official
+ * "TensorFlowLite_ESP32" library via Arduino Library Manager before compiling.
  */
 
 #include <Arduino.h>
@@ -28,23 +41,36 @@
 #include <HTTPClient.h>
 #include <Wire.h>
 #include <math.h>
-#include "esp_random.h"   // ESP32 hardware RNG for Xavier fallback init
+#include <mbedtls/sha256.h>   // for SHA256 hash verification of .tflite
+#include "esp_random.h"       // ESP32 hardware RNG for Xavier fallback init
+
+// ── TensorFlow Lite Micro (TFLM) — inference-only, no training APIs used ──────
+#include <TensorFlowLite_ESP32.h>
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/schema/schema_generated.h"
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const char* WIFI_SSID   = "Cybergaar";
 const char* WIFI_PASS   = "curedata4low";
 const char* SERVER_IP   = "10.219.84.92";
 const int   SERVER_PORT = 5000;
-const char* CLIENT_ID             = "esp32-node-C";   // unique per device
+const char* CLIENT_ID             = "esp32-node-A";   // unique per device
 
 const int   POLL_INTERVAL_MS          = 3000;  // idle poll cadence
 const int   INFERENCE_INTERVAL_MS     = 500;   // forward pass cadence in inference mode
 const int   SAMPLE_INTERVAL_MS        = 200;    // ms between MPU reads during collection
-const int   LOCAL_SAMPLES_PER_CLASS   = 5;   // samples collected per activity window
+const int   LOCAL_SAMPLES_PER_CLASS   = 30;   // samples collected per activity window
 const int   LOCAL_EPOCHS              = 6;
 const float LEARNING_RATE             = 0.01f;
 const int   ACTIVE_CLASSES            = 2;    // how many classes to train per round (1–OUTPUT_DIM)
 const int   CLASS_TRANSITION_DELAY_MS = 5000; // pause between classes so user can reposition
+
+// ── TinyML / TFLM config (inference-only) ──────────────────────────────────────
+const int   TFLM_TENSOR_ARENA_SIZE   = 8 * 1024;   // 8KB arena — generous for this tiny model
+const int   BENCHMARK_REPORT_EVERY_N = 20;          // upload a benchmark report every N inferences
+const char* TFLITE_MODEL_URL_PATH    = "/model.tflite";
 
 // ── Model dimensions ─────────────────────────────────────────────────────────
 #define INPUT_DIM     9
@@ -75,13 +101,28 @@ float W2[HIDDEN1][HIDDEN2],   b2[HIDDEN2];
 float W3[HIDDEN2][OUTPUT_DIM],b3[OUTPUT_DIM];
 
 // ── Client state ──────────────────────────────────────────────────────────────
-enum ClientPhase { PHASE_IDLE, PHASE_TRAIN, PHASE_INFERENCE };
+enum ClientPhase { PHASE_IDLE, PHASE_TRAIN, PHASE_DOWNLOAD_MODEL, PHASE_INFERENCE };
 ClientPhase clientPhase   = PHASE_IDLE;
 int         currentRound  = 0;
 bool        registered    = false;
 
 // Per-epoch cross-entropy losses averaged across all classes, sent to server
 float epochLosses[LOCAL_EPOCHS];
+
+// ── TFLM state (inference-only) ────────────────────────────────────────────────
+uint8_t  tfArena[TFLM_TENSOR_ARENA_SIZE];
+uint8_t* tfliteModelBuffer   = nullptr;   // heap-allocated; holds raw .tflite bytes
+size_t   tfliteModelSize     = 0;
+bool     tfliteModelLoaded   = false;
+String   serverTfliteHash    = "";        // hash announced by server in /status
+
+tflite::MicroInterpreter* tfInterpreter = nullptr;
+tflite::MicroMutableOpResolver<4>* tfResolver = nullptr;   // FC + ReLU + Softmax + Quantize/Dequantize
+const tflite::Model* tfModel = nullptr;
+TfLiteTensor* tfInputTensor  = nullptr;
+TfLiteTensor* tfOutputTensor = nullptr;
+
+int inferenceCount = 0;   // counts inference passes since entering PHASE_INFERENCE
 
 // ── Xavier weight initialisation (ESP32 hardware RNG fallback) ────────────────
 // Used if server is unreachable at boot. downloadModel() overwrites if successful.
@@ -341,6 +382,14 @@ String pollStatus(float* weights_out = nullptr, int* round_out = nullptr) {
     if (ri >= 0) *round_out = payload.substring(ri + 8).toInt();
   }
 
+  // Extract tflite_hash if present (sent during download_model / inference instructions)
+  int th = payload.indexOf("\"tflite_hash\":\"");
+  if (th >= 0) {
+    int hs = th + 16;
+    int he = payload.indexOf("\"", hs);
+    serverTfliteHash = payload.substring(hs, he);
+  }
+
   // Extract weights if caller wants them
   if (weights_out && payload.indexOf("\"weights\"") >= 0) {
     int dummy = 0;
@@ -449,7 +498,251 @@ void verifyWeightsWithServer() {
   }
 }
 
-// ── Local training — interleaved classes, no catastrophic forgetting ──────────
+// ════════════════════════════════════════════════════════════════════════════
+// TinyML (TFLM) — inference-only additions. Nothing above this point in the
+// training pipeline is touched; these functions only run during the
+// PHASE_DOWNLOAD_MODEL and PHASE_INFERENCE states.
+// ════════════════════════════════════════════════════════════════════════════
+
+// Compute SHA256 of a byte buffer, return as lowercase hex string
+String sha256Hex(const uint8_t* data, size_t len) {
+  unsigned char hash[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);   // 0 = SHA-256 (not SHA-224)
+  mbedtls_sha256_update(&ctx, data, len);
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+
+  char hexStr[65];
+  for (int i = 0; i < 32; i++) sprintf(hexStr + i * 2, "%02x", hash[i]);
+  hexStr[64] = '\0';
+  return String(hexStr);
+}
+
+// Download the .tflite binary from the server into a heap buffer.
+// Returns true on success; fills tfliteModelBuffer / tfliteModelSize.
+bool downloadTfliteModel() {
+  Serial.println("[TFLM] Downloading .tflite model …");
+  HTTPClient http;
+  http.begin(serverUrl(TFLITE_MODEL_URL_PATH));
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[TFLM] Download failed HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+
+  int len = http.getSize();
+  if (len <= 0) {
+    Serial.println("[TFLM] Invalid content length");
+    http.end();
+    return false;
+  }
+
+  // Free any previous buffer before allocating a new one
+  if (tfliteModelBuffer != nullptr) {
+    free(tfliteModelBuffer);
+    tfliteModelBuffer = nullptr;
+  }
+  tfliteModelBuffer = (uint8_t*)malloc(len);
+  if (tfliteModelBuffer == nullptr) {
+    Serial.println("[TFLM] malloc failed — out of heap");
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  int bytesRead = 0;
+  unsigned long startMs = millis();
+  while (bytesRead < len && (millis() - startMs) < 15000) {
+    if (stream->available()) {
+      int n = stream->readBytes(tfliteModelBuffer + bytesRead, len - bytesRead);
+      bytesRead += n;
+    }
+    delay(1);
+  }
+  http.end();
+
+  if (bytesRead != len) {
+    Serial.printf("[TFLM] Incomplete download: %d / %d bytes\n", bytesRead, len);
+    free(tfliteModelBuffer);
+    tfliteModelBuffer = nullptr;
+    return false;
+  }
+
+  tfliteModelSize = len;
+  Serial.printf("[TFLM] Downloaded %d bytes\n", len);
+  return true;
+}
+
+// Build the TFLM interpreter from the downloaded model buffer.
+// Must be called once after a successful, hash-verified download.
+bool setupTfliteInterpreter() {
+  tfModel = tflite::GetModel(tfliteModelBuffer);
+  if (tfModel->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.printf("[TFLM] Schema version mismatch: model=%d expected=%d\n",
+                  tfModel->version(), TFLITE_SCHEMA_VERSION);
+    return false;
+  }
+
+  // Only register the ops this tiny model actually uses — keeps flash small
+  static tflite::MicroMutableOpResolver<4> resolver;
+  resolver.AddFullyConnected();
+  resolver.AddRelu();
+  resolver.AddSoftmax();
+  resolver.AddQuantize();   // present if converter inserted quantize/dequantize ops
+
+  static tflite::MicroInterpreter staticInterpreter(
+      tfModel, resolver, tfArena, TFLM_TENSOR_ARENA_SIZE);
+  tfInterpreter = &staticInterpreter;
+
+  TfLiteStatus allocStatus = tfInterpreter->AllocateTensors();
+  if (allocStatus != kTfLiteOk) {
+    Serial.println("[TFLM] AllocateTensors() failed — arena too small?");
+    return false;
+  }
+
+  tfInputTensor  = tfInterpreter->input(0);
+  tfOutputTensor = tfInterpreter->output(0);
+
+  Serial.printf("[TFLM] Interpreter ready — arena used: %d / %d bytes\n",
+                tfInterpreter->arena_used_bytes(), TFLM_TENSOR_ARENA_SIZE);
+  return true;
+}
+
+// Full pipeline: download .tflite, verify SHA256 against server hash,
+// build interpreter, confirm with server via /confirm_model.
+// Returns true only if EVERY step succeeds — this is the integrity gate
+// that ensures this client uses the exact same model as the server.
+bool acquireAndVerifyTfliteModel() {
+  if (!downloadTfliteModel()) return false;
+
+  String localHash = sha256Hex(tfliteModelBuffer, tfliteModelSize);
+  Serial.printf("[TFLM] Local hash:  %s\n", localHash.c_str());
+  Serial.printf("[TFLM] Server hash: %s\n", serverTfliteHash.c_str());
+
+  bool hashMatch = localHash.equalsIgnoreCase(serverTfliteHash);
+  if (!hashMatch) {
+    Serial.println("[TFLM] ✗ HASH MISMATCH — refusing to load model");
+  }
+
+  // Report confirmation to server regardless of match — server tracks per-
+  // client status and will not release "inference" until ALL clients match
+  HTTPClient http;
+  http.begin(serverUrl("/confirm_model"));
+  http.addHeader("Content-Type", "application/json");
+  String body = "{\"client_id\":\"";
+  body += CLIENT_ID;
+  body += "\",\"tflite_hash\":\"";
+  body += localHash;
+  body += "\"}";
+  int code = http.POST(body);
+  String resp = http.getString();
+  http.end();
+
+  if (code == 200) {
+    Serial.printf("[TFLM] Confirmation sent — server response: %s\n", resp.c_str());
+  } else {
+    Serial.printf("[TFLM] Confirmation POST failed HTTP %d\n", code);
+  }
+
+  if (!hashMatch) return false;
+
+  if (!setupTfliteInterpreter()) {
+    Serial.println("[TFLM] Interpreter setup failed");
+    return false;
+  }
+
+  tfliteModelLoaded = true;
+  Serial.println("[TFLM] ✓ Model verified and loaded — ready for inference");
+  return true;
+}
+
+// Run one TFLM forward pass. Fills outProbs[OUTPUT_DIM] (dequantized to
+// float32 if the model is int8) and returns predicted class index.
+// Also fills *latencyUs with wall-clock inference time in microseconds.
+int tflmInfer(const float* x9, float* outProbs, unsigned long* latencyUs) {
+  unsigned long t0 = micros();
+
+  // Fill input tensor — supports both float32 and int8 quantized input
+  if (tfInputTensor->type == kTfLiteFloat32) {
+    for (int i = 0; i < INPUT_DIM; i++) tfInputTensor->data.f[i] = x9[i];
+  } else if (tfInputTensor->type == kTfLiteInt8) {
+    float scale      = tfInputTensor->params.scale;
+    int   zeroPoint  = tfInputTensor->params.zero_point;
+    for (int i = 0; i < INPUT_DIM; i++) {
+      int32_t q = (int32_t)roundf(x9[i] / scale) + zeroPoint;
+      tfInputTensor->data.int8[i] = (int8_t)constrain(q, -128, 127);
+    }
+  }
+
+  TfLiteStatus invokeStatus = tfInterpreter->Invoke();
+  *latencyUs = micros() - t0;
+
+  if (invokeStatus != kTfLiteOk) {
+    Serial.println("[TFLM] Invoke() failed");
+    for (int j = 0; j < OUTPUT_DIM; j++) outProbs[j] = 0.0f;
+    return -1;
+  }
+
+  // Read output tensor — dequantize if int8
+  if (tfOutputTensor->type == kTfLiteFloat32) {
+    for (int j = 0; j < OUTPUT_DIM; j++) outProbs[j] = tfOutputTensor->data.f[j];
+  } else if (tfOutputTensor->type == kTfLiteInt8) {
+    float scale     = tfOutputTensor->params.scale;
+    int   zeroPoint = tfOutputTensor->params.zero_point;
+    for (int j = 0; j < OUTPUT_DIM; j++)
+      outProbs[j] = (tfOutputTensor->data.int8[j] - zeroPoint) * scale;
+  }
+
+  int best = 0;
+  for (int j = 1; j < OUTPUT_DIM; j++)
+    if (outProbs[j] > outProbs[best]) best = j;
+  return best;
+}
+
+// Upload a benchmark comparison report to the server
+void uploadBenchmarkReport(unsigned long hwLatencyUs, unsigned long tflmLatencyUs,
+                            float hwConfidence, float tflmConfidence,
+                            int hwClass, int tflmClass) {
+  String body = "{\"client_id\":\"";
+  body += CLIENT_ID;
+  body += "\",\"handwritten_latency_us\":";
+  body += String(hwLatencyUs);
+  body += ",\"tflm_latency_us\":";
+  body += String(tflmLatencyUs);
+  // RAM footprint: hand-written model uses static global arrays — compute
+  // analytically. TFLM arena usage is read from the interpreter.
+  body += ",\"handwritten_ram_bytes\":";
+  body += String((int)(TOTAL_WEIGHTS * sizeof(float)));
+  body += ",\"tflm_arena_bytes\":";
+  body += String((int)(tfInterpreter ? tfInterpreter->arena_used_bytes() : 0));
+  body += ",\"handwritten_confidence\":";
+  body += String(hwConfidence, 4);
+  body += ",\"tflm_confidence\":";
+  body += String(tflmConfidence, 4);
+  body += ",\"predictions_match\":";
+  body += (hwClass == tflmClass) ? "1" : "0";
+  body += ",\"predicted_class\":";
+  body += String(hwClass);
+  body += "}";
+
+  HTTPClient http;
+  http.begin(serverUrl("/benchmark_report"));
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(8000);
+  int code = http.POST(body);
+  http.end();
+
+  if (code == 200) {
+    Serial.println("[Benchmark] Report uploaded ✓");
+  } else {
+    Serial.printf("[Benchmark] Upload failed HTTP %d\n", code);
+  }
+}
+
+
 // All class samples are collected first, then shuffled together so every epoch
 // sees gradients from all classes, preventing the last class from overwriting.
 void runLocalTraining() {
@@ -531,21 +824,54 @@ void runLocalTraining() {
   Serial.println("[FL] ── Training complete ──");
 }
 
-// ── Inference — single forward pass, print class ──────────────────────────────
+// ── Inference — DUAL: hand-written forward pass + TFLM, benchmarked ───────────
+// Both methods run on the SAME sensor sample for a fair comparison. Every
+// BENCHMARK_REPORT_EVERY_N inferences, a comparison report is uploaded.
 void runInference() {
   float x[INPUT_DIM];
   if (!read_sensors(x)) return;
 
-  float h1[HIDDEN1], h2[HIDDEN2], out[OUTPUT_DIM];
-  forward(x, h1, h2, out);
-  int predicted = 0;
+  // ── (a) Existing hand-written float32 inference — UNCHANGED logic ──
+  unsigned long hwStart = micros();
+  float h1[HIDDEN1], h2[HIDDEN2], hwProbs[OUTPUT_DIM];
+  forward(x, h1, h2, hwProbs);
+  unsigned long hwLatencyUs = micros() - hwStart;
+  int hwPredicted = 0;
   for (int j = 1; j < OUTPUT_DIM; j++)
-    if (out[j] > out[predicted]) predicted = j;
+    if (hwProbs[j] > hwProbs[hwPredicted]) hwPredicted = j;
 
-  Serial.printf("[INF] %s  (%.2f%%)  probs=[%.3f %.3f %.3f %.3f]\n",
-                CLASS_NAMES[predicted],
-                100.0f * out[predicted],
-                out[0], out[1], out[2], out[3]);
+  Serial.printf("[INF-HW]   %-8s (%.2f%%)  %lu us  probs=[%.3f %.3f %.3f %.3f]\n",
+                CLASS_NAMES[hwPredicted], 100.0f * hwProbs[hwPredicted], hwLatencyUs,
+                hwProbs[0], hwProbs[1], hwProbs[2], hwProbs[3]);
+
+  // ── (b) TFLM inference — only if model loaded and verified ──
+  if (tfliteModelLoaded) {
+    float tflmProbs[OUTPUT_DIM];
+    unsigned long tflmLatencyUs = 0;
+    int tflmPredicted = tflmInfer(x, tflmProbs, &tflmLatencyUs);
+
+    if (tflmPredicted >= 0) {
+      Serial.printf("[INF-TFLM] %-8s (%.2f%%)  %lu us  probs=[%.3f %.3f %.3f %.3f]\n",
+                    CLASS_NAMES[tflmPredicted], 100.0f * tflmProbs[tflmPredicted], tflmLatencyUs,
+                    tflmProbs[0], tflmProbs[1], tflmProbs[2], tflmProbs[3]);
+
+      const char* agree = (hwPredicted == tflmPredicted) ? "✓ AGREE" : "✗ DISAGREE";
+      float speedup = (tflmLatencyUs > 0) ? (float)hwLatencyUs / (float)tflmLatencyUs : 0.0f;
+      Serial.printf("[INF-CMP]  %s  |  speedup=%.2fx  |  HW_RAM=%dB  TFLM_arena=%dB\n",
+                    agree, speedup,
+                    (int)(TOTAL_WEIGHTS * sizeof(float)),
+                    (int)tfInterpreter->arena_used_bytes());
+
+      inferenceCount++;
+      if (inferenceCount % BENCHMARK_REPORT_EVERY_N == 0) {
+        uploadBenchmarkReport(hwLatencyUs, tflmLatencyUs,
+                              hwProbs[hwPredicted], tflmProbs[tflmPredicted],
+                              hwPredicted, tflmPredicted);
+      }
+    }
+  } else {
+    Serial.println("[INF-TFLM] (not loaded — running hand-written only)");
+  }
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -601,11 +927,26 @@ void loop() {
       if (instr == "train") {
         clientPhase = PHASE_TRAIN;
 
-      } else if (instr == "inference") {
-        Serial.println("[FL] → INFERENCE MODE");
-        unflattenWeights(weights);   // load final converged weights from server
+      } else if (instr == "download_model") {
+        // FL converged; TFLite ready on server but THIS client hasn't
+        // confirmed the hash yet — load hand-written weights as fallback,
+        // then move to the dedicated download/verify phase
+        unflattenWeights(weights);
         currentRound = serverRound;
-        verifyWeightsWithServer();   // integrity check: local must == server
+        clientPhase = PHASE_DOWNLOAD_MODEL;
+
+      } else if (instr == "inference") {
+        // All clients (including this one) already confirmed the model
+        // hash in a previous cycle — just load weights and go straight to
+        // dual inference
+        Serial.println("[FL] → INFERENCE MODE (model already verified)");
+        unflattenWeights(weights);
+        currentRound = serverRound;
+        if (!tfliteModelLoaded) {
+          // Edge case: client restarted after acking — reacquire model
+          acquireAndVerifyTfliteModel();
+        }
+        inferenceCount = 0;
         clientPhase = PHASE_INFERENCE;
 
       } else {
@@ -623,7 +964,24 @@ void loop() {
       break;
     }
 
-    // ── INFERENCE: run forward pass on live sensor data ──────────────────────
+    // ── DOWNLOAD_MODEL: fetch .tflite, verify hash, confirm with server ──────
+    case PHASE_DOWNLOAD_MODEL: {
+      Serial.println("\n[FL] ── FL converged — acquiring TFLite model ──");
+      bool ok = acquireAndVerifyTfliteModel();
+      if (ok) {
+        Serial.println("[FL] Model verified — waiting for other clients …");
+      } else {
+        Serial.println("[FL] Model verification failed — will retry on next poll");
+      }
+      // Either way, return to idle; server will re-send "download_model"
+      // until this client's ack is recorded, then send "inference" once
+      // ALL clients have acked
+      clientPhase = PHASE_IDLE;
+      delay(POLL_INTERVAL_MS);
+      break;
+    }
+
+    // ── INFERENCE: run dual forward pass (hand-written + TFLM), benchmark ────
     case PHASE_INFERENCE: {
       runInference();
       delay(INFERENCE_INTERVAL_MS);
@@ -635,6 +993,7 @@ void loop() {
         String instr = pollStatus();
         if (instr == "train") {
           Serial.println("[FL] New FL cycle detected — returning to IDLE");
+          tfliteModelLoaded = false;   // model will be replaced; force re-verify next cycle
           clientPhase = PHASE_IDLE;
         }
       }

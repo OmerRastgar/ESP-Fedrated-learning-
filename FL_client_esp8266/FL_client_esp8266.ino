@@ -1,19 +1,14 @@
 /*
- * Federated Learning Client — ESP32 (Arduino IDE)
+ * Federated Learning Client — ESP8266 (Arduino IDE)
  *
  * Activity classifier: STILL(0) | WALKING(1) | SHAKING(2) | TAPPING(3)
  * Sensor: MPU6050 — 6 real features (ax,ay,az,gx,gy,gz) + 3 zeros = INPUT_DIM 9
  *
- * Key design decisions vs previous revision:
- *   - Output layer uses SOFTMAX (not linear) → probability distribution over 4 classes
- *   - Loss is CROSS-ENTROPY (not MSE) → correct gradient for classification
- *   - SGD gradient = softmax_out - one_hot_label  (softmax+CE combined derivative)
- *   - Training cycles all 4 classes locally each round (no server involvement):
- *       STILL → WALKING → SHAKING → TAPPING, each with LOCAL_SAMPLES_PER_CLASS
- *       samples. All classes are trained before weights are uploaded once.
- *   - Xavier init from ESP32 hardware RNG (esp_random) used as fallback if
- *     server unreachable on boot
- *   - Inference calls infer() which returns argmax class index + name string
+ * ESP8266 differences vs ESP32 version:
+ *   - I2C pins: SDA = GPIO 4 (D2), SCL = GPIO 5 (D1)
+ *   - Libraries: ESP8266WiFi.h, ESP8266HTTPClient.h
+ *   - Random: uses random() instead of esp_random()
+ *   - Memory: more constrained, same model architecture fits
  *
  * Server-managed round lifecycle (clients poll /status):
  *   wait      → stay idle, poll again after POLL_INTERVAL_MS
@@ -24,27 +19,27 @@
  */
 
 #include <Arduino.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
 #include <Wire.h>
 #include <math.h>
-#include "esp_random.h"   // ESP32 hardware RNG for Xavier fallback init
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const char* WIFI_SSID   = "Cybergaar";
 const char* WIFI_PASS   = "curedata4low";
 const char* SERVER_IP   = "10.219.84.92";
 const int   SERVER_PORT = 5000;
-const char* CLIENT_ID             = "esp32-node-C";   // unique per device
+const char* CLIENT_ID             = "esp8266-node-D";   // unique per device
 
 const int   POLL_INTERVAL_MS          = 3000;  // idle poll cadence
 const int   INFERENCE_INTERVAL_MS     = 500;   // forward pass cadence in inference mode
-const int   SAMPLE_INTERVAL_MS        = 200;    // ms between MPU reads during collection
-const int   LOCAL_SAMPLES_PER_CLASS   = 5;   // samples collected per activity window
+const int   SAMPLE_INTERVAL_MS        = 200;   // ms between MPU reads during collection
+const int   LOCAL_SAMPLES_PER_CLASS   = 25;    // samples collected per activity window
 const int   LOCAL_EPOCHS              = 6;
 const float LEARNING_RATE             = 0.01f;
-const int   ACTIVE_CLASSES            = 2;    // how many classes to train per round (1–OUTPUT_DIM)
-const int   CLASS_TRANSITION_DELAY_MS = 5000; // pause between classes so user can reposition
+const int   ACTIVE_CLASSES            = 2;     // how many classes to train per round (1–OUTPUT_DIM)
+const int   CLASS_TRANSITION_DELAY_MS = 5000;  // pause between classes so user can reposition
 
 // ── Model dimensions ─────────────────────────────────────────────────────────
 #define INPUT_DIM     9
@@ -53,15 +48,18 @@ const int   CLASS_TRANSITION_DELAY_MS = 5000; // pause between classes so user c
 #define OUTPUT_DIM    4    // one output neuron per activity class
 #define TOTAL_WEIGHTS 332  // (9*16+16)+(16*8+8)+(8*4+4) = 160+136+36
 
+// ── ESP8266 I2C pins ─────────────────────────────────────────────────────────
+#define SDA_PIN 4   // GPIO 4 (D2)
+#define SCL_PIN 5   // GPIO 5 (D1)
+
 // ── Activity class definitions ────────────────────────────────────────────────
-// Index must match server CLASS_NAMES order
 #define CLASS_STILL   0
 #define CLASS_WALKING 1
 #define CLASS_SHAKING 2
 #define CLASS_TAPPING 3
 const char* CLASS_NAMES[OUTPUT_DIM] = {"STILL", "WALKING", "SHAKING", "TAPPING"};
 
-// One-hot label vectors for each class — used as training targets
+// One-hot label vectors for each class
 const float ONE_HOT[OUTPUT_DIM][OUTPUT_DIM] = {
   {1, 0, 0, 0},   // STILL
   {0, 1, 0, 0},   // WALKING
@@ -80,16 +78,14 @@ ClientPhase clientPhase   = PHASE_IDLE;
 int         currentRound  = 0;
 bool        registered    = false;
 
-// Per-epoch cross-entropy losses averaged across all classes, sent to server
+// Per-epoch cross-entropy losses
 float epochLosses[LOCAL_EPOCHS];
 
-// ── Xavier weight initialisation (ESP32 hardware RNG fallback) ────────────────
-// Used if server is unreachable at boot. downloadModel() overwrites if successful.
+// ── Xavier weight initialisation (random() fallback for ESP8266) ──────────────
 void initWeightsLocal() {
   auto xav = [](int fan_in, int fan_out) -> float {
     float limit = sqrtf(6.0f / (fan_in + fan_out));
-    // esp_random() returns uint32; map to [-1000, 1000] then scale
-    return ((float)((int32_t)(esp_random() % 2001) - 1000) / 1000.0f) * limit;
+    return ((float)(random(2001) - 1000) / 1000.0f) * limit;
   };
   for (int i = 0; i < INPUT_DIM; i++)
     for (int j = 0; j < HIDDEN1; j++) W1[i][j] = xav(INPUT_DIM, HIDDEN1);
@@ -100,7 +96,7 @@ void initWeightsLocal() {
   for (int i = 0; i < HIDDEN2; i++)
     for (int j = 0; j < OUTPUT_DIM; j++) W3[i][j] = xav(HIDDEN2, OUTPUT_DIM);
   for (int j = 0; j < OUTPUT_DIM; j++) b3[j] = 0.0f;
-  Serial.println("[FL] Weights initialised locally via Xavier + ESP32 RNG");
+  Serial.println("[FL] Weights initialised locally via Xavier + random()");
 }
 
 // ── Weight serialisation ──────────────────────────────────────────────────────
@@ -131,7 +127,6 @@ void unflattenWeights(const float* flat) {
 }
 
 // ── JSON helpers ──────────────────────────────────────────────────────────────
-// Parse 332 weights from a nested JSON array, plus optional "round" field.
 bool parseWeightsFromJson(const String& payload, float* weights_out, int& round_out) {
   int ri = payload.indexOf("\"round\":");
   if (ri >= 0) round_out = payload.substring(ri + 8).toInt();
@@ -161,8 +156,6 @@ bool parseWeightsFromJson(const String& payload, float* weights_out, int& round_
 // ── Neural network — forward pass with SOFTMAX output ────────────────────────
 inline float relu(float x) { return x > 0.0f ? x : 0.0f; }
 
-// h1_out[HIDDEN1], h2_out[HIDDEN2], out[OUTPUT_DIM] must be caller-allocated.
-// out[] contains softmax probabilities summing to 1.0 after return.
 void forward(const float* x, float* h1_out, float* h2_out, float* out) {
   // Hidden layer 1 — ReLU
   for (int j = 0; j < HIDDEN1; j++) {
@@ -177,7 +170,6 @@ void forward(const float* x, float* h1_out, float* h2_out, float* out) {
     h2_out[j] = relu(s);
   }
   // Output layer — Softmax
-  // Subtract max logit for numerical stability before exp()
   float logits[OUTPUT_DIM];
   float max_logit = -1e9f;
   for (int j = 0; j < OUTPUT_DIM; j++) {
@@ -194,7 +186,6 @@ void forward(const float* x, float* h1_out, float* h2_out, float* out) {
   for (int j = 0; j < OUTPUT_DIM; j++) out[j] /= sum_exp;
 }
 
-// Run forward pass and return predicted class index (argmax of softmax output)
 int infer(const float* x) {
   float h1[HIDDEN1], h2[HIDDEN2], out[OUTPUT_DIM];
   forward(x, h1, h2, out);
@@ -205,18 +196,14 @@ int infer(const float* x) {
 }
 
 // ── SGD step with CROSS-ENTROPY + SOFTMAX combined gradient ──────────────────
-// The combined gradient simplifies to: dL/d(logit_j) = softmax_j - y_j
-// where y_j is the one-hot label. No separate softmax backward needed.
 void sgd_step(const float* x, const float* one_hot_label) {
   float h1[HIDDEN1], h2[HIDDEN2], out[OUTPUT_DIM];
   forward(x, h1, h2, out);
 
-  // Output gradient: softmax_j - y_j
   float dout[OUTPUT_DIM];
   for (int j = 0; j < OUTPUT_DIM; j++)
     dout[j] = out[j] - one_hot_label[j];
 
-  // W3, b3 gradients + propagate to h2
   float dh2[HIDDEN2] = {};
   for (int i = 0; i < HIDDEN2; i++) {
     for (int j = 0; j < OUTPUT_DIM; j++) {
@@ -226,10 +213,8 @@ void sgd_step(const float* x, const float* one_hot_label) {
   }
   for (int j = 0; j < OUTPUT_DIM; j++) b3[j] -= LEARNING_RATE * dout[j];
 
-  // ReLU gate on h2
   for (int i = 0; i < HIDDEN2; i++) dh2[i] = (h2[i] > 0.0f) ? dh2[i] : 0.0f;
 
-  // W2, b2 gradients + propagate to h1
   float dh1[HIDDEN1] = {};
   for (int i = 0; i < HIDDEN1; i++) {
     for (int j = 0; j < HIDDEN2; j++) {
@@ -239,30 +224,23 @@ void sgd_step(const float* x, const float* one_hot_label) {
   }
   for (int j = 0; j < HIDDEN2; j++) b2[j] -= LEARNING_RATE * dh2[j];
 
-  // ReLU gate on h1
   for (int i = 0; i < HIDDEN1; i++) dh1[i] = (h1[i] > 0.0f) ? dh1[i] : 0.0f;
 
-  // W1, b1 gradients
   for (int i = 0; i < INPUT_DIM; i++)
     for (int j = 0; j < HIDDEN1; j++)
       W1[i][j] -= LEARNING_RATE * dh1[j] * x[i];
   for (int j = 0; j < HIDDEN1; j++) b1[j] -= LEARNING_RATE * dh1[j];
 }
 
-// Cross-entropy loss for one sample: -log(softmax[true_class])
 float cross_entropy(const float* x, int true_class) {
   float h1[HIDDEN1], h2[HIDDEN2], out[OUTPUT_DIM];
   forward(x, h1, h2, out);
   float p = out[true_class];
-  if (p < 1e-7f) p = 1e-7f;   // clamp to avoid log(0)
+  if (p < 1e-7f) p = 1e-7f;
   return -logf(p);
 }
 
 // ── MPU6050 sensor read ───────────────────────────────────────────────────────
-// Returns 9-element feature vector:
-//   [0-2] accelerometer (g)      normalised by ±2g range (16384 LSB/g)
-//   [3-5] gyroscope (normalised) at ±250 deg/s range (131 LSB/deg/s)
-//   [6-8] reserved zeros — node-A has no additional sensors
 bool read_sensors(float* out9) {
   Wire.beginTransmission(0x68);
   Wire.write(0x3B);
@@ -273,20 +251,20 @@ bool read_sensors(float* out9) {
   int16_t ax = (Wire.read() << 8) | Wire.read();
   int16_t ay = (Wire.read() << 8) | Wire.read();
   int16_t az = (Wire.read() << 8) | Wire.read();
-  Wire.read(); Wire.read();   // skip internal temperature bytes
+  Wire.read(); Wire.read();   // skip temperature
   int16_t gx = (Wire.read() << 8) | Wire.read();
   int16_t gy = (Wire.read() << 8) | Wire.read();
   int16_t gz = (Wire.read() << 8) | Wire.read();
 
-  out9[0] = ax / 16384.0f;          // accel X  (g)
-  out9[1] = ay / 16384.0f;          // accel Y  (g)
-  out9[2] = az / 16384.0f;          // accel Z  (g)
-  out9[3] = gx / 131.0f / 250.0f;   // gyro  X  (normalised)
-  out9[4] = gy / 131.0f / 250.0f;   // gyro  Y  (normalised)
-  out9[5] = gz / 131.0f / 250.0f;   // gyro  Z  (normalised)
-  out9[6] = 0.0f;                    // reserved
-  out9[7] = 0.0f;                    // reserved
-  out9[8] = 0.0f;                    // reserved
+  out9[0] = ax / 16384.0f;
+  out9[1] = ay / 16384.0f;
+  out9[2] = az / 16384.0f;
+  out9[3] = gx / 131.0f / 250.0f;
+  out9[4] = gy / 131.0f / 250.0f;
+  out9[5] = gz / 131.0f / 250.0f;
+  out9[6] = 0.0f;
+  out9[7] = 0.0f;
+  out9[8] = 0.0f;
   return true;
 }
 
@@ -296,8 +274,9 @@ String serverUrl(const char* path) {
 }
 
 bool httpRegister() {
+  WiFiClient client;
   HTTPClient http;
-  http.begin(serverUrl("/register"));
+  http.begin(client, serverUrl("/register"));
   http.addHeader("Content-Type", "application/json");
   String body = "{\"client_id\":\"";
   body += CLIENT_ID;
@@ -312,13 +291,13 @@ bool httpRegister() {
   return false;
 }
 
-// Poll /status — fills weights_out and round_out if non-null.
 String pollStatus(float* weights_out = nullptr, int* round_out = nullptr) {
+  WiFiClient client;
   HTTPClient http;
   String url = serverUrl("/status");
   url += "?client_id=";
   url += CLIENT_ID;
-  http.begin(url);
+  http.begin(client, url);
   int code = http.GET();
   if (code != 200) {
     http.end();
@@ -328,20 +307,17 @@ String pollStatus(float* weights_out = nullptr, int* round_out = nullptr) {
   String payload = http.getString();
   http.end();
 
-  // Extract instruction string
   int ii = payload.indexOf("\"instruction\":\"");
   if (ii < 0) return "wait";
   int is = ii + 15;
   int ie = payload.indexOf("\"", is);
   String instruction = payload.substring(is, ie);
 
-  // Extract round number
   if (round_out) {
     int ri = payload.indexOf("\"round\":");
     if (ri >= 0) *round_out = payload.substring(ri + 8).toInt();
   }
 
-  // Extract weights if caller wants them
   if (weights_out && payload.indexOf("\"weights\"") >= 0) {
     int dummy = 0;
     parseWeightsFromJson(payload, weights_out, dummy);
@@ -351,8 +327,9 @@ String pollStatus(float* weights_out = nullptr, int* round_out = nullptr) {
 }
 
 bool downloadModel() {
+  WiFiClient client;
   HTTPClient http;
-  http.begin(serverUrl("/model"));
+  http.begin(client, serverUrl("/model"));
   int code = http.GET();
   if (code != 200) {
     http.end();
@@ -385,7 +362,6 @@ bool uploadWeights(int n_samples) {
   body += ",\"n_samples\":";
   body += String(n_samples);
 
-  // Per-epoch cross-entropy losses
   body += ",\"epoch_losses\":[";
   for (int e = 0; e < LOCAL_EPOCHS; e++) {
     body += String(epochLosses[e], 5);
@@ -393,7 +369,6 @@ bool uploadWeights(int n_samples) {
   }
   body += "]";
 
-  // Flattened weights
   body += ",\"weights\":[";
   for (int i = 0; i < TOTAL_WEIGHTS; i++) {
     body += String(flat[i], 6);
@@ -401,8 +376,9 @@ bool uploadWeights(int n_samples) {
   }
   body += "]}";
 
+  WiFiClient client;
   HTTPClient http;
-  http.begin(serverUrl("/update"));
+  http.begin(client, serverUrl("/update"));
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(15000);
   int code = http.POST(body);
@@ -410,16 +386,15 @@ bool uploadWeights(int n_samples) {
   http.end();
 
   if (code == 200) {
-    Serial.println("[FL] Upload OK ✓");
+    Serial.println("[FL] Upload OK");
     return true;
   }
   Serial.printf("[FL] Upload FAILED HTTP %d — %s\n", code, resp.c_str());
   return false;
 }
 
-// ── Weight verification ───────────────────────────────────────────────────────
 void verifyWeightsWithServer() {
-  Serial.println("[FL] Verifying local weights == server global weights …");
+  Serial.println("[FL] Verifying local weights == server global weights...");
   float flat[TOTAL_WEIGHTS];
   flattenWeights(flat);
 
@@ -432,8 +407,9 @@ void verifyWeightsWithServer() {
   }
   body += "]}";
 
+  WiFiClient client;
   HTTPClient http;
-  http.begin(serverUrl("/verify_weights"));
+  http.begin(client, serverUrl("/verify_weights"));
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(10000);
   int code = http.POST(body);
@@ -443,19 +419,16 @@ void verifyWeightsWithServer() {
   if (code == 200) {
     bool matched = resp.indexOf("\"match\":true") >= 0;
     Serial.printf("[FL] Weight verification: %s\n",
-                  matched ? "✓ PASSED — local == server" : "✗ FAILED — mismatch!");
+                  matched ? "PASSED — local == server" : "FAILED — mismatch!");
   } else {
     Serial.printf("[FL] Verification request failed HTTP %d\n", code);
   }
 }
 
-// ── Local training — interleaved classes, no catastrophic forgetting ──────────
-// All class samples are collected first, then shuffled together so every epoch
-// sees gradients from all classes, preventing the last class from overwriting.
+// ── Local training ────────────────────────────────────────────────────────────
 void runLocalTraining() {
-  Serial.println("\n[FL] ── Training started (interleaved classes) ──");
+  Serial.println("\n[FL] Training started (interleaved classes)");
 
-  // 1. Download latest global model; fall back to existing local weights
   if (!downloadModel()) {
     Serial.println("[FL] Using existing local weights");
   }
@@ -464,12 +437,10 @@ void runLocalTraining() {
   float samples[TOTAL_SAMPLES][INPUT_DIM];
   int   labels[TOTAL_SAMPLES];
 
-  // 2. Collect samples per-class (user performs each activity in order)
   int sampleIdx = 0;
   for (int cls = 0; cls < ACTIVE_CLASSES; cls++) {
-    Serial.printf("\n[FL] ── Class %d/%d: %s ──\n",
-                  cls + 1, ACTIVE_CLASSES, CLASS_NAMES[cls]);
-    Serial.printf("[FL] >>> Perform %s now! Collecting %d samples …\n",
+    Serial.printf("\n[FL] Class %d/%d: %s\n", cls + 1, ACTIVE_CLASSES, CLASS_NAMES[cls]);
+    Serial.printf("[FL] Perform %s now! Collecting %d samples...\n",
                   CLASS_NAMES[cls], LOCAL_SAMPLES_PER_CLASS);
 
     int collected = 0;
@@ -481,24 +452,23 @@ void runLocalTraining() {
         sampleIdx++;
         collected++;
         if (collected % 10 == 0)
-          Serial.printf("  … %d / %d\n", collected, LOCAL_SAMPLES_PER_CLASS);
+          Serial.printf("  %d / %d\n", collected, LOCAL_SAMPLES_PER_CLASS);
       }
       delay(SAMPLE_INTERVAL_MS);
     }
     Serial.printf("[FL] Collected %d samples for %s\n", collected, CLASS_NAMES[cls]);
 
-    // Pause so user can reposition (skip after last class)
     if (cls < ACTIVE_CLASSES - 1) {
-      Serial.printf("[FL] Next class in %d s — get ready …\n",
+      Serial.printf("[FL] Next class in %d s — get ready...\n",
                     CLASS_TRANSITION_DELAY_MS / 1000);
       delay(CLASS_TRANSITION_DELAY_MS);
     }
   }
 
-  // 3. Fisher-Yates shuffle — mix all class samples together
-  Serial.println("\n[FL] Shuffling samples …");
+  // Fisher-Yates shuffle
+  Serial.println("\n[FL] Shuffling samples...");
   for (int i = TOTAL_SAMPLES - 1; i > 0; i--) {
-    int j = esp_random() % (i + 1);
+    int j = random(i + 1);
     float temp[INPUT_DIM];
     memcpy(temp, samples[i], sizeof(temp));
     memcpy(samples[i], samples[j], sizeof(samples[i]));
@@ -508,7 +478,7 @@ void runLocalTraining() {
     labels[j] = t;
   }
 
-  // 4. Train — each epoch sees all classes interleaved
+  // Train
   for (int e = 0; e < LOCAL_EPOCHS; e++) {
     float total_loss = 0.0f;
     for (int t = 0; t < TOTAL_SAMPLES; t++) {
@@ -519,19 +489,18 @@ void runLocalTraining() {
     Serial.printf("  Epoch %d/%d  CE-loss=%.5f\n", e + 1, LOCAL_EPOCHS, epochLosses[e]);
   }
 
-  // 5. Accuracy on full training set
+  // Accuracy
   int correct = 0;
   for (int t = 0; t < TOTAL_SAMPLES; t++)
     if (infer(samples[t]) == labels[t]) correct++;
   Serial.printf("[FL] Training accuracy: %d/%d (%.1f%%)\n",
                 correct, TOTAL_SAMPLES, 100.0f * correct / TOTAL_SAMPLES);
 
-  // 6. Upload final weights to server
   uploadWeights(TOTAL_SAMPLES);
-  Serial.println("[FL] ── Training complete ──");
+  Serial.println("[FL] Training complete");
 }
 
-// ── Inference — single forward pass, print class ──────────────────────────────
+// ── Inference ─────────────────────────────────────────────────────────────────
 void runInference() {
   float x[INPUT_DIM];
   if (!read_sensors(x)) return;
@@ -552,16 +521,18 @@ void runInference() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n[Boot] FL Activity Classifier — ESP32");
+  Serial.println("\n[Boot] FL Activity Classifier — ESP8266");
 
-  // Initialise MPU6050
-  Wire.begin(21, 22);
+  // Initialise MPU6050 with ESP8266 I2C pins
+  Wire.begin(SDA_PIN, SCL_PIN);
   Wire.beginTransmission(0x68);
   Wire.write(0x6B); Wire.write(0x00);   // wake from sleep
   Wire.endTransmission();
   Serial.println("[MPU] MPU6050 awake");
 
-  // Local Xavier weight fallback — overwritten by server model if reachable
+  // Seed random for Xavier init
+  randomSeed(analogRead(A0));
+
   initWeightsLocal();
 
   // Connect WiFi
@@ -570,7 +541,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
   Serial.printf("\n[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
 
-  // Register with FL server — retry indefinitely
+  // Register with FL server
   while (!registered) {
     registered = httpRegister();
     if (!registered) delay(3000);
@@ -579,9 +550,8 @@ void setup() {
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 void loop() {
-  // WiFi watchdog
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Reconnecting …");
+    Serial.println("[WiFi] Reconnecting...");
     WiFi.reconnect();
     delay(3000);
     return;
@@ -589,7 +559,6 @@ void loop() {
 
   switch (clientPhase) {
 
-    // ── IDLE: poll server, wait for instruction ──────────────────────────────
     case PHASE_IDLE: {
       int serverRound = 0;
       float weights[TOTAL_WEIGHTS];
@@ -600,35 +569,29 @@ void loop() {
 
       if (instr == "train") {
         clientPhase = PHASE_TRAIN;
-
       } else if (instr == "inference") {
-        Serial.println("[FL] → INFERENCE MODE");
-        unflattenWeights(weights);   // load final converged weights from server
+        Serial.println("[FL] INFERENCE MODE");
+        unflattenWeights(weights);
         currentRound = serverRound;
-        verifyWeightsWithServer();   // integrity check: local must == server
+        verifyWeightsWithServer();
         clientPhase = PHASE_INFERENCE;
-
       } else {
-        // "wait" — poll again after interval
         delay(POLL_INTERVAL_MS);
       }
       break;
     }
 
-    // ── TRAIN: collect labelled samples, train, upload ───────────────────────
     case PHASE_TRAIN: {
       runLocalTraining();
       clientPhase = PHASE_IDLE;
-      delay(1000);   // brief pause before next poll
+      delay(1000);
       break;
     }
 
-    // ── INFERENCE: run forward pass on live sensor data ──────────────────────
     case PHASE_INFERENCE: {
       runInference();
       delay(INFERENCE_INTERVAL_MS);
 
-      // Check every 60 s if a new FL cycle has started
       static unsigned long lastCycleCheck = 0;
       if (millis() - lastCycleCheck > 60000UL) {
         lastCycleCheck = millis();
