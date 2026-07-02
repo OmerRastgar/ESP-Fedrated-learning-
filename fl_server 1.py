@@ -5,22 +5,17 @@ Federated Learning Orchestration Server
 - Sequential training: one client trains at a time
 - Convergence: loss below threshold OR plateau detection
 - After convergence: inference mode, 15-min cooldown, then next FL cycle
-- TFLite model generation for ESP32 inference
 """
 
 import json
 import time
 import threading
-import os
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from collections import defaultdict
-
-# Import TFLite model manager
-from tflite_model_manager import update_tflite_model, get_tflite_model_path, get_model_data_header
 
 app = Flask(__name__)
 
@@ -28,7 +23,6 @@ app = Flask(__name__)
 INPUT_DIM   = 9
 HIDDEN1     = 16
 HIDDEN2     = 8
-
 OUTPUT_DIM  = 4
 TOTAL_WEIGHTS = (INPUT_DIM*HIDDEN1 + HIDDEN1) + (HIDDEN1*HIDDEN2 + HIDDEN2) + (HIDDEN2*OUTPUT_DIM + OUTPUT_DIM)
 
@@ -37,7 +31,7 @@ MIN_CLIENTS          = 2          # configurable: minimum clients before a round
 CONVERGENCE_LOSS     = 0.01       # absolute loss threshold
 CONVERGENCE_PLATEAU  = 5          # rounds with < this % improvement → converged
 PLATEAU_TOLERANCE    = 0.005      # minimum relative improvement to not count as plateau
-MAX_ROUNDS           = 5     # hard cap
+MAX_ROUNDS           = 10     # hard cap
 INFERENCE_COOLDOWN_S = 900        # 15 minutes between FL cycles
 
 # ─── State ─────────────────────────────────────────────────────────────────────
@@ -181,13 +175,6 @@ def aggregate_round():
     state.history_loss.append(avg_loss)
     print(f"[Round {state.round_number}] Avg loss = {avg_loss:.5f}")
 
-    # Update TFLite model with new weights
-    try:
-        update_tflite_model(state.global_weights)
-        print(f"[Round {state.round_number}] TFLite model updated")
-    except Exception as e:
-        print(f"[Round {state.round_number}] TFLite update failed: {e}")
-
     save_plots()
 
     converged, reason = check_convergence()
@@ -313,21 +300,6 @@ def receive_update():
         flat.extend(layer if isinstance(layer, list) else [layer])
     if len(flat) != TOTAL_WEIGHTS:
         return jsonify({"error": f"wrong weight count: {len(flat)}"}), 400
-    
-    # Reshape flat weights to nested [W1, b1, W2, b2, W3, b3] format
-    flat_arr = np.array(flat, dtype=float)
-    shapes = [
-        (INPUT_DIM, HIDDEN1), (HIDDEN1,),
-        (HIDDEN1, HIDDEN2), (HIDDEN2,),
-        (HIDDEN2, OUTPUT_DIM), (OUTPUT_DIM,),
-    ]
-    reshaped_weights = []
-    idx = 0
-    for s in shapes:
-        size = s[0] if len(s) == 1 else s[0] * s[1]
-        reshaped_weights.append(flat_arr[idx:idx+size].reshape(s).tolist())
-        idx += size
-    weights = reshaped_weights
 
     with lock:
         # Verify it's this client's turn
@@ -380,46 +352,6 @@ def verify_weights():
         print(f"[FL] Weight verification — {client_id}: {'✓ MATCH' if match else '✗ MISMATCH'}")
 
     return jsonify({"match": match, "client_id": client_id})
-
-# ─── TFLite model download endpoint ──────────────────────────────────────────
-
-@app.route("/download_tflite", methods=["GET"])
-def download_tflite():
-    """Download the latest TFLite model for ESP32 inference."""
-    # Always regenerate with latest global weights
-    try:
-        update_tflite_model(state.global_weights)
-    except Exception as e:
-        return jsonify({"error": f"Failed to generate TFLite model: {str(e)}"}), 500
-    
-    model_path = get_tflite_model_path()
-    if not os.path.exists(model_path):
-        return jsonify({"error": "TFLite model not found"}), 404
-    
-    return send_file(
-        model_path,
-        mimetype='application/octet-stream',
-        as_attachment=True,
-        download_name='fl_model.tflite'
-    )
-
-@app.route("/download_tflite_header", methods=["GET"])
-def download_tflite_header():
-    """Download the TFLite model as C header file for ESP32."""
-    header_content = get_model_data_header()
-    
-    if not header_content:
-        # Generate initial model if not exists
-        try:
-            update_tflite_model(state.global_weights)
-            header_content = get_model_data_header()
-        except Exception as e:
-            return jsonify({"error": f"Failed to generate TFLite header: {str(e)}"}), 500
-    
-    if not header_content:
-        return jsonify({"error": "TFLite header not found"}), 404
-    
-    return header_content, 200, {'Content-Type': 'text/plain'}
 
 # ─── Diagnostics ──────────────────────────────────────────────────────────────
 

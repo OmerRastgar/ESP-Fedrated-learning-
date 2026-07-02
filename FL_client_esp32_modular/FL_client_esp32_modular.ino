@@ -23,7 +23,11 @@
 
 // ── Include modular components ───────────────────────────────────────────────
 #include "model_config.h"
-#include "inference.h"
+
+// Choose inference method: uncomment ONE of the following
+//#include "inference.h"         // Manual forward pass (default)
+#include "inference_tflite.h"  // TFLite (requires compatible TensorFlowLite library)
+
 #include "training.h"
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -31,7 +35,7 @@ const char* WIFI_SSID   = "Cybergaar";
 const char* WIFI_PASS   = "curedata4low";
 const char* SERVER_IP   = "10.219.84.92";
 const int   SERVER_PORT = 5000;
-const char* CLIENT_ID   = "esp32-node-C";   // unique per device
+const char* CLIENT_ID   = "esp32-node-B";   // unique per device
 
 const int   POLL_INTERVAL_MS      = 3000;
 const int   INFERENCE_INTERVAL_MS = 500;
@@ -307,6 +311,9 @@ void loop() {
 
     case PHASE_TRAIN: {
       runLocalTraining();  // from training.h
+      // After training, weights are uploaded to server
+      // Server will update TFLite model with new weights
+      // TFLite model will be downloaded automatically on first inference call
       clientPhase = PHASE_IDLE;
       delay(1000);
       break;
