@@ -38,7 +38,7 @@ static const char *TAG = "FL_CLIENT";
 #define WIFI_PASS      "curedata4low"
 #define SERVER_IP      "10.219.84.92"
 #define SERVER_PORT    5000
-#define CLIENT_ID      "esp32-node-B"
+#define CLIENT_ID      "esp32-node-A"
 
 #define POLL_INTERVAL_MS      3000
 #define INFERENCE_INTERVAL_MS 500
@@ -1314,6 +1314,10 @@ extern "C" void app_main(void) {
     }
     
     ESP_LOGI(TAG, "FreeRTOS primitives created");
+    
+    // Initialize WiFi
+    wifi_init_sta();
+    ESP_LOGI(TAG, "WiFi initialized");
     
     // Create tasks
     xTaskCreatePinnedToCore(network_task, "network", 8192, NULL, 5, &network_task_handle, 0);
