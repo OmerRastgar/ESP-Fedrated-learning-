@@ -1026,6 +1026,11 @@ void runInference() {
 }
 
 // ── Network Task (HTTP + State Machine) ──────────────────────────────────────
+// Use static buffers to avoid stack overflow
+static float net_weights[TOTAL_WEIGHTS];
+static Command net_cmd;
+static WeightUpdate net_update;
+
 void network_task(void *pvParameters) {
     // 1. Register with server
     ESP_LOGI(TAG, "Network task: Registering with server...");
@@ -1046,30 +1051,27 @@ void network_task(void *pvParameters) {
         
         // Poll status from server
         char instruction[32];
-        float weights[TOTAL_WEIGHTS];
         int serverRound = 0;
         
-        pollStatus(weights, &serverRound, instruction, sizeof(instruction));
+        pollStatus(net_weights, &serverRound, instruction, sizeof(instruction));
         ESP_LOGI(TAG, "Network: %s round=%d", instruction, serverRound);
         
         if (strcmp(instruction, "train") == 0) {
             // Send train command to training task
-            Command cmd;
-            cmd.type = CMD_TRAIN;
-            cmd.round = serverRound;
-            memcpy(cmd.weights, weights, sizeof(weights));
+            net_cmd.type = CMD_TRAIN;
+            net_cmd.round = serverRound;
+            memcpy(net_cmd.weights, net_weights, sizeof(net_weights));
             
-            if (xQueueSend(command_queue, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            if (xQueueSend(command_queue, &net_cmd, pdMS_TO_TICKS(1000)) == pdTRUE) {
                 ESP_LOGI(TAG, "Network: Sent train command to training task");
                 
                 // Wait for weight update from training task
-                WeightUpdate update;
-                if (xQueueReceive(weight_queue, &update, pdMS_TO_TICKS(120000))) {
+                if (xQueueReceive(weight_queue, &net_update, pdMS_TO_TICKS(120000))) {
                     ESP_LOGI(TAG, "Network: Received weights from training task");
                     
                     // Upload weights to server
                     xSemaphoreTake(weight_mutex, portMAX_DELAY);
-                    uploadWeights(update.n_samples);
+                    uploadWeights(net_update.n_samples);
                     xSemaphoreGive(weight_mutex);
                 } else {
                     ESP_LOGW(TAG, "Network: Timeout waiting for weight update");
@@ -1081,7 +1083,7 @@ void network_task(void *pvParameters) {
         } else if (strcmp(instruction, "inference") == 0) {
             // Update global weights
             xSemaphoreTake(weight_mutex, portMAX_DELAY);
-            unflattenWeights(weights);
+            unflattenWeights(net_weights);
             currentRound = serverRound;
             xSemaphoreGive(weight_mutex);
             
@@ -1100,26 +1102,30 @@ void network_task(void *pvParameters) {
 }
 
 // ── Training Task ────────────────────────────────────────────────────────────
+// Use static buffers to avoid stack overflow
+static Command train_cmd;
+static WeightUpdate train_update;
+static float train_samples[ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS][INPUT_DIM];
+static int train_labels[ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS];
+static float train_epoch_losses[LOCAL_EPOCHS];
+
 void training_task(void *pvParameters) {
     while (1) {
         // Wait for train command from network task
-        Command cmd;
-        if (xQueueReceive(command_queue, &cmd, portMAX_DELAY) == pdTRUE) {
-            ESP_LOGI(TAG, "Training task: Received train command (round %d)", cmd.round);
+        if (xQueueReceive(command_queue, &train_cmd, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG, "Training task: Received train command (round %d)", train_cmd.round);
             
             // Load weights from command
             xSemaphoreTake(weight_mutex, portMAX_DELAY);
-            unflattenWeights(cmd.weights);
+            unflattenWeights(train_cmd.weights);
             xSemaphoreGive(weight_mutex);
             
             ESP_LOGI(TAG, "Training task: Loaded weights from server");
             
             // Collect sensor data
             const int TOTAL_SAMPLES = ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS;
-            float samples[TOTAL_SAMPLES][INPUT_DIM];
-            int labels[TOTAL_SAMPLES];
+            sampleIdx = 0;
             
-            int sampleIdx = 0;
             for (int cls = 0; cls < ACTIVE_CLASSES; cls++) {
                 ESP_LOGI(TAG, "Training task: Collecting class %d/%d: %s", 
                          cls + 1, ACTIVE_CLASSES, CLASS_NAMES[cls]);
@@ -1127,8 +1133,8 @@ void training_task(void *pvParameters) {
                 for (int i = 0; i < LOCAL_SAMPLES_PER_CLASS; i++) {
                     float s[INPUT_DIM];
                     if (read_sensors(s)) {
-                        memcpy(samples[sampleIdx], s, sizeof(s));
-                        labels[sampleIdx] = cls;
+                        memcpy(train_samples[sampleIdx], s, sizeof(s));
+                        train_labels[sampleIdx] = cls;
                         sampleIdx++;
                     }
                     vTaskDelay(pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
@@ -1146,17 +1152,16 @@ void training_task(void *pvParameters) {
             for (int i = TOTAL_SAMPLES - 1; i > 0; i--) {
                 int j = esp_random() % (i + 1);
                 float temp[INPUT_DIM];
-                memcpy(temp, samples[i], sizeof(temp));
-                memcpy(samples[i], samples[j], sizeof(samples[i]));
-                memcpy(samples[j], temp, sizeof(temp));
-                int t = labels[i];
-                labels[i] = labels[j];
-                labels[j] = t;
+                memcpy(temp, train_samples[i], sizeof(temp));
+                memcpy(train_samples[i], train_samples[j], sizeof(train_samples[i]));
+                memcpy(train_samples[j], temp, sizeof(temp));
+                int t = train_labels[i];
+                train_labels[i] = train_labels[j];
+                train_labels[j] = t;
             }
             
             // Train epochs
             ESP_LOGI(TAG, "Training task: Starting training...");
-            float epoch_losses[LOCAL_EPOCHS];
             xSemaphoreTake(weight_mutex, portMAX_DELAY);
             
             for (int e = 0; e < LOCAL_EPOCHS; e++) {
@@ -1164,27 +1169,27 @@ void training_task(void *pvParameters) {
                 float total_loss = 0.0f;
                 
                 for (int t = 0; t < TOTAL_SAMPLES; t++) {
-                    sgd_step(samples[t], ONE_HOT[labels[t]]);
-                    total_loss += cross_entropy(samples[t], labels[t]);
+                    sgd_step(train_samples[t], ONE_HOT[train_labels[t]]);
+                    total_loss += cross_entropy(train_samples[t], train_labels[t]);
                 }
                 
-                epoch_losses[e] = total_loss / TOTAL_SAMPLES;
+                train_epoch_losses[e] = total_loss / TOTAL_SAMPLES;
                 int64_t epoch_end = esp_timer_get_time();
                 ESP_LOGI(TAG, "Training task: Epoch %d/%d CE-loss=%.5f (%lld ms)", 
-                         e + 1, LOCAL_EPOCHS, epoch_losses[e], (epoch_end - epoch_start) / 1000);
+                         e + 1, LOCAL_EPOCHS, train_epoch_losses[e], (epoch_end - epoch_start) / 1000);
             }
             
             xSemaphoreGive(weight_mutex);
             
             // Check for NaN
-            float flat[TOTAL_WEIGHTS];
+            static float flat_weights[TOTAL_WEIGHTS];
             xSemaphoreTake(weight_mutex, portMAX_DELAY);
-            flattenWeights(flat);
+            flattenWeights(flat_weights);
             xSemaphoreGive(weight_mutex);
             
             bool has_nan = false;
             for (int i = 0; i < TOTAL_WEIGHTS; i++) {
-                if (isnan(flat[i]) || isinf(flat[i])) {
+                if (isnan(flat_weights[i]) || isinf(flat_weights[i])) {
                     has_nan = true;
                     break;
                 }
@@ -1196,12 +1201,11 @@ void training_task(void *pvParameters) {
             }
             
             // Send weight update to network task
-            WeightUpdate update;
-            memcpy(update.weights, flat, sizeof(flat));
-            memcpy(update.epoch_losses, epoch_losses, sizeof(epoch_losses));
-            update.n_samples = TOTAL_SAMPLES;
+            memcpy(train_update.weights, flat_weights, sizeof(flat_weights));
+            memcpy(train_update.epoch_losses, train_epoch_losses, sizeof(train_epoch_losses));
+            train_update.n_samples = TOTAL_SAMPLES;
             
-            if (xQueueSend(weight_queue, &update, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            if (xQueueSend(weight_queue, &train_update, pdMS_TO_TICKS(1000)) == pdTRUE) {
                 ESP_LOGI(TAG, "Training task: Sent weights to network task");
             } else {
                 ESP_LOGW(TAG, "Training task: Failed to send weight update");
