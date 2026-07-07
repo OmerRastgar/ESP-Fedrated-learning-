@@ -490,6 +490,7 @@ const char* serverUrl(const char* path) {
 
 // ── HTTP GET helper ───────────────────────────────────────────────────────────
 bool httpGet(const char* url, char* response, int max_len) {
+    int64_t http_start = esp_timer_get_time();
     esp_http_client_config_t config = {};
     config.url = url;
     config.timeout_ms = 10000;
@@ -518,12 +519,14 @@ bool httpGet(const char* url, char* response, int max_len) {
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     
-    ESP_LOGI(TAG, "HTTP GET %d bytes from %s", total_read, url);
+    int64_t http_end = esp_timer_get_time();
+    ESP_LOGI(TAG, "HTTP GET %d bytes from %s (%lld ms)", total_read, url, (http_end - http_start) / 1000);
     return true;
 }
 
 // ── HTTP POST helper ──────────────────────────────────────────────────────────
 int httpPost(const char* url, const char* body, char* response, int max_len) {
+    int64_t http_start = esp_timer_get_time();
     esp_http_client_config_t config = {};
     config.url = url;
     config.timeout_ms = 15000;
@@ -559,6 +562,9 @@ int httpPost(const char* url, const char* body, char* response, int max_len) {
     int status = esp_http_client_get_status_code(client);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    
+    int64_t http_end = esp_timer_get_time();
+    ESP_LOGI(TAG, "HTTP POST %s status=%d (%lld ms)", url, status, (http_end - http_start) / 1000);
     return status;
 }
 
@@ -834,12 +840,16 @@ bool initTFLite() {
 
 // ── Run training (same as training.h) ─────────────────────────────────────────
 void runLocalTraining() {
+    int64_t train_start = esp_timer_get_time();
     ESP_LOGI(TAG, "Training started (interleaved classes)");
     
     // 1. Download latest global model
+    int64_t dl_start = esp_timer_get_time();
     if (!downloadModel()) {
         ESP_LOGI(TAG, "Using existing local weights");
     }
+    int64_t dl_end = esp_timer_get_time();
+    ESP_LOGI(TAG, "Model download latency: %lld ms", (dl_end - dl_start) / 1000);
     
     const int TOTAL_SAMPLES = ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS;
     float samples[TOTAL_SAMPLES][INPUT_DIM];
@@ -887,13 +897,15 @@ void runLocalTraining() {
     
     // 4. Train epochs
     for (int e = 0; e < LOCAL_EPOCHS; e++) {
+        int64_t epoch_start = esp_timer_get_time();
         float total_loss = 0.0f;
         for (int t = 0; t < TOTAL_SAMPLES; t++) {
             sgd_step(samples[t], ONE_HOT[labels[t]]);
             total_loss += cross_entropy(samples[t], labels[t]);
         }
         epochLosses[e] = total_loss / TOTAL_SAMPLES;
-        ESP_LOGI(TAG, "Epoch %d/%d CE-loss=%.5f", e + 1, LOCAL_EPOCHS, epochLosses[e]);
+        int64_t epoch_end = esp_timer_get_time();
+        ESP_LOGI(TAG, "Epoch %d/%d CE-loss=%.5f (%lld ms)", e + 1, LOCAL_EPOCHS, epochLosses[e], (epoch_end - epoch_start) / 1000);
     }
     
     // 5. Accuracy check
@@ -920,8 +932,13 @@ void runLocalTraining() {
     }
     
     // 7. Upload weights
+    int64_t upload_start = esp_timer_get_time();
     uploadWeights(TOTAL_SAMPLES);
-    ESP_LOGI(TAG, "Training complete");
+    int64_t upload_end = esp_timer_get_time();
+    ESP_LOGI(TAG, "Upload latency: %lld ms", (upload_end - upload_start) / 1000);
+    
+    int64_t train_end = esp_timer_get_time();
+    ESP_LOGI(TAG, "Training complete (total: %lld ms)", (train_end - train_start) / 1000);
 }
 
 // ── Run inference (uses TFLite if available, else manual) ─────────────────────
@@ -996,6 +1013,13 @@ void fl_task(void *pvParameters) {
     ESP_LOGI(TAG, "Registered! Starting FL loop...");
     
     while (1) {
+        // Log stack high water mark every loop iteration
+        UBaseType_t stack_remaining = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(TAG, "Stack remaining: %lu bytes", stack_remaining * sizeof(StackType_t));
+        
+        // Log heap status
+        ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
+        
         switch (clientPhase) {
             case PHASE_IDLE: {
                 int serverRound = 0;
