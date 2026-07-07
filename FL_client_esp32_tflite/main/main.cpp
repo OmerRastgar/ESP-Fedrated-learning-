@@ -1124,7 +1124,7 @@ void training_task(void *pvParameters) {
             
             // Collect sensor data
             const int TOTAL_SAMPLES = ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS;
-            sampleIdx = 0;
+            int sampleIdx = 0;
             
             for (int cls = 0; cls < ACTIVE_CLASSES; cls++) {
                 ESP_LOGI(TAG, "Training task: Collecting class %d/%d: %s", 
