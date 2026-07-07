@@ -14,6 +14,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -36,7 +38,7 @@ static const char *TAG = "FL_CLIENT";
 #define WIFI_PASS      "curedata4low"
 #define SERVER_IP      "10.219.84.92"
 #define SERVER_PORT    5000
-#define CLIENT_ID      "esp32-node-A"
+#define CLIENT_ID      "esp32-node-B"
 
 #define POLL_INTERVAL_MS      3000
 #define INFERENCE_INTERVAL_MS 500
@@ -80,6 +82,34 @@ ClientPhase clientPhase = PHASE_IDLE;
 int currentRound = 0;
 bool registered = false;
 float epochLosses[LOCAL_EPOCHS];
+
+// ── FreeRTOS synchronization primitives ───────────────────────────────────────
+SemaphoreHandle_t weight_mutex = NULL;
+SemaphoreHandle_t phase_mutex = NULL;
+SemaphoreHandle_t tflite_mutex = NULL;
+
+// ── Inter-task communication ──────────────────────────────────────────────────
+enum CommandType { CMD_TRAIN, CMD_STOP };
+struct Command {
+    CommandType type;
+    float weights[TOTAL_WEIGHTS];
+    int round;
+};
+
+struct WeightUpdate {
+    float weights[TOTAL_WEIGHTS];
+    float epoch_losses[LOCAL_EPOCHS];
+    int n_samples;
+};
+
+QueueHandle_t command_queue = NULL;    // Network → Training
+QueueHandle_t weight_queue = NULL;     // Training → Network
+
+// ── Task handles ──────────────────────────────────────────────────────────────
+TaskHandle_t network_task_handle = NULL;
+TaskHandle_t training_task_handle = NULL;
+TaskHandle_t inference_task_handle = NULL;
+TaskHandle_t inference_task_handle = NULL;
 
 // ── TFLite globals ────────────────────────────────────────────────────────────
 #define TFLITE_ARENA_SIZE (32 * 1024)
@@ -996,82 +1026,238 @@ void runInference() {
     }
 }
 
-// ── FL task ───────────────────────────────────────────────────────────────────
-void fl_task(void *pvParameters) {
-    initWeightsLocal();
-    
-    // Register with server
-    ESP_LOGI(TAG, "Registering with server...");
+// ── Network Task (HTTP + State Machine) ──────────────────────────────────────
+void network_task(void *pvParameters) {
+    // 1. Register with server
+    ESP_LOGI(TAG, "Network task: Registering with server...");
     while (!registered) {
         registered = httpRegister();
         if (!registered) {
-            ESP_LOGI(TAG, "Registration failed, retrying in 3s...");
+            ESP_LOGI(TAG, "Network task: Registration failed, retrying in 3s...");
             vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
+    ESP_LOGI(TAG, "Network task: Registered!");
     
-    ESP_LOGI(TAG, "Registered! Starting FL loop...");
-    
+    // 2. Main loop - poll status and manage state
     while (1) {
-        // Log stack high water mark every loop iteration
+        // Log stack and heap status
         UBaseType_t stack_remaining = uxTaskGetStackHighWaterMark(NULL);
-        ESP_LOGI(TAG, "Stack remaining: %lu bytes", stack_remaining * sizeof(StackType_t));
+        ESP_LOGI(TAG, "Network task stack: %lu bytes", stack_remaining * sizeof(StackType_t));
         
-        // Log heap status
-        ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
+        // Poll status from server
+        char instruction[32];
+        float weights[TOTAL_WEIGHTS];
+        int serverRound = 0;
         
-        switch (clientPhase) {
-            case PHASE_IDLE: {
-                int serverRound = 0;
-                float weights[TOTAL_WEIGHTS];
-                char instruction[32];
+        pollStatus(weights, &serverRound, instruction, sizeof(instruction));
+        ESP_LOGI(TAG, "Network: %s round=%d", instruction, serverRound);
+        
+        if (strcmp(instruction, "train") == 0) {
+            // Send train command to training task
+            Command cmd;
+            cmd.type = CMD_TRAIN;
+            cmd.round = serverRound;
+            memcpy(cmd.weights, weights, sizeof(weights));
+            
+            if (xQueueSend(command_queue, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                ESP_LOGI(TAG, "Network: Sent train command to training task");
                 
-                pollStatus(weights, &serverRound, instruction, sizeof(instruction));
-                
-                ESP_LOGI(TAG, "IDLE — %s round=%d", instruction, serverRound);
-                
-                if (strcmp(instruction, "train") == 0) {
-                    clientPhase = PHASE_TRAIN;
-                } else if (strcmp(instruction, "inference") == 0) {
-                    ESP_LOGI(TAG, "INFERENCE MODE");
-                    unflattenWeights(weights);
-                    currentRound = serverRound;
-                    ESP_LOGI(TAG, "Manual weights loaded successfully (round %d)", currentRound);
-                    verifyWeightsWithServer();
-                    clientPhase = PHASE_INFERENCE;
+                // Wait for weight update from training task
+                WeightUpdate update;
+                if (xQueueReceive(weight_queue, &update, pdMS_TO_TICKS(120000))) {
+                    ESP_LOGI(TAG, "Network: Received weights from training task");
+                    
+                    // Upload weights to server
+                    xSemaphoreTake(weight_mutex, portMAX_DELAY);
+                    uploadWeights(update.n_samples);
+                    xSemaphoreGive(weight_mutex);
                 } else {
-                    vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+                    ESP_LOGW(TAG, "Network: Timeout waiting for weight update");
                 }
-                break;
+            } else {
+                ESP_LOGW(TAG, "Network: Failed to send train command");
             }
             
-            case PHASE_TRAIN: {
-                runLocalTraining();
-                clientPhase = PHASE_IDLE;
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                break;
-            }
+        } else if (strcmp(instruction, "inference") == 0) {
+            // Update global weights
+            xSemaphoreTake(weight_mutex, portMAX_DELAY);
+            unflattenWeights(weights);
+            currentRound = serverRound;
+            xSemaphoreGive(weight_mutex);
             
-            case PHASE_INFERENCE: {
-                runInference();
-                vTaskDelay(pdMS_TO_TICKS(INFERENCE_INTERVAL_MS));
+            ESP_LOGI(TAG, "Network: Loaded inference weights (round %d)", serverRound);
+            
+            // Notify inference task to start
+            xTaskNotify(inference_task_handle, 0, eNoAction);
+            
+        } else {
+            // "wait" - poll again after interval
+            vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(1000));  // Small delay between polls
+    }
+}
+
+// ── Training Task ────────────────────────────────────────────────────────────
+void training_task(void *pvParameters) {
+    while (1) {
+        // Wait for train command from network task
+        Command cmd;
+        if (xQueueReceive(command_queue, &cmd, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG, "Training task: Received train command (round %d)", cmd.round);
+            
+            // Load weights from command
+            xSemaphoreTake(weight_mutex, portMAX_DELAY);
+            unflattenWeights(cmd.weights);
+            xSemaphoreGive(weight_mutex);
+            
+            ESP_LOGI(TAG, "Training task: Loaded weights from server");
+            
+            // Collect sensor data
+            const int TOTAL_SAMPLES = ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS;
+            float samples[TOTAL_SAMPLES][INPUT_DIM];
+            int labels[TOTAL_SAMPLES];
+            
+            int sampleIdx = 0;
+            for (int cls = 0; cls < ACTIVE_CLASSES; cls++) {
+                ESP_LOGI(TAG, "Training task: Collecting class %d/%d: %s", 
+                         cls + 1, ACTIVE_CLASSES, CLASS_NAMES[cls]);
                 
-                // Check every 60s if new FL cycle started
-                static TickType_t lastCycleCheck = 0;
-                if (xTaskGetTickCount() - lastCycleCheck > pdMS_TO_TICKS(60000)) {
-                    lastCycleCheck = xTaskGetTickCount();
-                    char instruction[32];
-                    pollStatus(NULL, NULL, instruction, sizeof(instruction));
-                    if (strcmp(instruction, "train") == 0) {
-                        ESP_LOGI(TAG, "New cycle detected — resetting TFLite model");
-                        tflite_model_downloaded = false;
-                        tflite_initialized = false;
-                        clientPhase = PHASE_IDLE;
+                for (int i = 0; i < LOCAL_SAMPLES_PER_CLASS; i++) {
+                    float s[INPUT_DIM];
+                    if (read_sensors(s)) {
+                        memcpy(samples[sampleIdx], s, sizeof(s));
+                        labels[sampleIdx] = cls;
+                        sampleIdx++;
                     }
+                    vTaskDelay(pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
                 }
-                break;
+                
+                if (cls < ACTIVE_CLASSES - 1) {
+                    ESP_LOGI(TAG, "Training task: Next class in %d s...", 
+                             CLASS_TRANSITION_DELAY_MS / 1000);
+                    vTaskDelay(pdMS_TO_TICKS(CLASS_TRANSITION_DELAY_MS));
+                }
+            }
+            
+            // Shuffle samples
+            ESP_LOGI(TAG, "Training task: Shuffling samples...");
+            for (int i = TOTAL_SAMPLES - 1; i > 0; i--) {
+                int j = esp_random() % (i + 1);
+                float temp[INPUT_DIM];
+                memcpy(temp, samples[i], sizeof(temp));
+                memcpy(samples[i], samples[j], sizeof(samples[i]));
+                memcpy(samples[j], temp, sizeof(temp));
+                int t = labels[i];
+                labels[i] = labels[j];
+                labels[j] = t;
+            }
+            
+            // Train epochs
+            ESP_LOGI(TAG, "Training task: Starting training...");
+            xSemaphoreTake(weight_mutex, portMAX_DELAY);
+            
+            for (int e = 0; e < LOCAL_EPOCHS; e++) {
+                int64_t epoch_start = esp_timer_get_time();
+                float total_loss = 0.0f;
+                
+                for (int t = 0; t < TOTAL_SAMPLES; t++) {
+                    sgd_step(samples[t], ONE_HOT[labels[t]]);
+                    total_loss += cross_entropy(samples[t], labels[t]);
+                }
+                
+                cmd.epoch_losses[e] = total_loss / TOTAL_SAMPLES;
+                int64_t epoch_end = esp_timer_get_time();
+                ESP_LOGI(TAG, "Training task: Epoch %d/%d CE-loss=%.5f (%lld ms)", 
+                         e + 1, LOCAL_EPOCHS, cmd.epoch_losses[e], (epoch_end - epoch_start) / 1000);
+            }
+            
+            xSemaphoreGive(weight_mutex);
+            
+            // Check for NaN
+            float flat[TOTAL_WEIGHTS];
+            xSemaphoreTake(weight_mutex, portMAX_DELAY);
+            flattenWeights(flat);
+            xSemaphoreGive(weight_mutex);
+            
+            bool has_nan = false;
+            for (int i = 0; i < TOTAL_WEIGHTS; i++) {
+                if (isnan(flat[i]) || isinf(flat[i])) {
+                    has_nan = true;
+                    break;
+                }
+            }
+            
+            if (has_nan) {
+                ESP_LOGE(TAG, "Training task: NaN/Inf detected - skipping upload");
+                continue;
+            }
+            
+            // Send weight update to network task
+            WeightUpdate update;
+            memcpy(update.weights, flat, sizeof(flat));
+            memcpy(update.epoch_losses, cmd.epoch_losses, sizeof(cmd.epoch_losses));
+            update.n_samples = TOTAL_SAMPLES;
+            
+            if (xQueueSend(weight_queue, &update, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                ESP_LOGI(TAG, "Training task: Sent weights to network task");
+            } else {
+                ESP_LOGW(TAG, "Training task: Failed to send weight update");
             }
         }
+    }
+}
+
+// ── Inference Task ───────────────────────────────────────────────────────────
+void inference_task(void *pvParameters) {
+    // Wait for notification from network task
+    ESP_LOGI(TAG, "Inference task: Waiting for weights...");
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "Inference task: Starting inference");
+    
+    while (1) {
+        // Read sensor
+        float x[INPUT_DIM];
+        if (!read_sensors(x)) {
+            vTaskDelay(pdMS_TO_TICKS(INFERENCE_INTERVAL_MS));
+            continue;
+        }
+        
+        float h1[HIDDEN1], h2[HIDDEN2], out_tflite[OUTPUT_DIM], out_manual[OUTPUT_DIM];
+        
+        // TFLite inference with metrics
+        xSemaphoreTake(tflite_mutex, portMAX_DELAY);
+        if (tflite_initialized) {
+            int64_t t0 = esp_timer_get_time();
+            forward_tflite(x, h1, h2, out_tflite);
+            int64_t t1 = esp_timer_get_time();
+            
+            int pred_tflite = 0;
+            for (int j = 1; j < OUTPUT_DIM; j++)
+                if (out_tflite[j] > out_tflite[pred_tflite]) pred_tflite = j;
+            
+            ESP_LOGI(TAG, "[TFLite] %s (%.1f%%) | %lld us", 
+                     CLASS_NAMES[pred_tflite], 100.0f * out_tflite[pred_tflite], t1 - t0);
+        }
+        xSemaphoreGive(tflite_mutex);
+        
+        // Manual inference with metrics
+        xSemaphoreTake(weight_mutex, portMAX_DELAY);
+        int64_t t0 = esp_timer_get_time();
+        forward_manual(x, h1, h2, out_manual);
+        int64_t t1 = esp_timer_get_time();
+        xSemaphoreGive(weight_mutex);
+        
+        int pred_manual = 0;
+        for (int j = 1; j < OUTPUT_DIM; j++)
+            if (out_manual[j] > out_manual[pred_manual]) pred_manual = j;
+        
+        ESP_LOGI(TAG, "[Manual] %s (%.1f%%) | %lld us", 
+                 CLASS_NAMES[pred_manual], 100.0f * out_manual[pred_manual], t1 - t0);
+        
+        vTaskDelay(pdMS_TO_TICKS(INFERENCE_INTERVAL_MS));
     }
 }
 
@@ -1081,7 +1267,7 @@ extern "C" void app_main(void) {
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set("FL_CLIENT", ESP_LOG_INFO);
     
-    ESP_LOGI(TAG, "FL Client — ESP32 (ESP-IDF + TFLite)");
+    ESP_LOGI(TAG, "FL Client — ESP32 (ESP-IDF + TFLite + FreeRTOS)");
     
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -1105,13 +1291,38 @@ extern "C" void app_main(void) {
     i2c_cmd_link_delete(cmd);
     ESP_LOGI(TAG, "MPU6050 awake");
     
-    // Initialize WiFi
-    wifi_init_sta();
+    // Initialize weights
+    initWeightsLocal();
     
-    // Start FL task
-    xTaskCreate(fl_task, "fl_task", 32768, NULL, 5, NULL);
+    // Create mutexes
+    weight_mutex = xSemaphoreCreateMutex();
+    phase_mutex = xSemaphoreCreateMutex();
+    tflite_mutex = xSemaphoreCreateMutex();
     
-    // Block forever
+    if (weight_mutex == NULL || phase_mutex == NULL || tflite_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create mutexes");
+        return;
+    }
+    
+    // Create queues
+    command_queue = xQueueCreate(1, sizeof(Command));
+    weight_queue = xQueueCreate(1, sizeof(WeightUpdate));
+    
+    if (command_queue == NULL || weight_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create queues");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "FreeRTOS primitives created");
+    
+    // Create tasks
+    xTaskCreatePinnedToCore(network_task, "network", 8192, NULL, 5, &network_task_handle, 0);
+    xTaskCreatePinnedToCore(training_task, "training", 8192, NULL, 3, &training_task_handle, 1);
+    xTaskCreatePinnedToCore(inference_task, "inference", 4096, NULL, 4, &inference_task_handle, 1);
+    
+    ESP_LOGI(TAG, "All tasks created");
+    
+    // Block forever (main task not needed)
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
