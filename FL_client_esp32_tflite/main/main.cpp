@@ -109,7 +109,6 @@ QueueHandle_t weight_queue = NULL;     // Training → Network
 TaskHandle_t network_task_handle = NULL;
 TaskHandle_t training_task_handle = NULL;
 TaskHandle_t inference_task_handle = NULL;
-TaskHandle_t inference_task_handle = NULL;
 
 // ── TFLite globals ────────────────────────────────────────────────────────────
 #define TFLITE_ARENA_SIZE (32 * 1024)
@@ -1157,6 +1156,7 @@ void training_task(void *pvParameters) {
             
             // Train epochs
             ESP_LOGI(TAG, "Training task: Starting training...");
+            float epoch_losses[LOCAL_EPOCHS];
             xSemaphoreTake(weight_mutex, portMAX_DELAY);
             
             for (int e = 0; e < LOCAL_EPOCHS; e++) {
@@ -1168,10 +1168,10 @@ void training_task(void *pvParameters) {
                     total_loss += cross_entropy(samples[t], labels[t]);
                 }
                 
-                cmd.epoch_losses[e] = total_loss / TOTAL_SAMPLES;
+                epoch_losses[e] = total_loss / TOTAL_SAMPLES;
                 int64_t epoch_end = esp_timer_get_time();
                 ESP_LOGI(TAG, "Training task: Epoch %d/%d CE-loss=%.5f (%lld ms)", 
-                         e + 1, LOCAL_EPOCHS, cmd.epoch_losses[e], (epoch_end - epoch_start) / 1000);
+                         e + 1, LOCAL_EPOCHS, epoch_losses[e], (epoch_end - epoch_start) / 1000);
             }
             
             xSemaphoreGive(weight_mutex);
@@ -1198,7 +1198,7 @@ void training_task(void *pvParameters) {
             // Send weight update to network task
             WeightUpdate update;
             memcpy(update.weights, flat, sizeof(flat));
-            memcpy(update.epoch_losses, cmd.epoch_losses, sizeof(cmd.epoch_losses));
+            memcpy(update.epoch_losses, epoch_losses, sizeof(epoch_losses));
             update.n_samples = TOTAL_SAMPLES;
             
             if (xQueueSend(weight_queue, &update, pdMS_TO_TICKS(1000)) == pdTRUE) {
