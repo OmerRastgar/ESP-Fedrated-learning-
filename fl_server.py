@@ -38,7 +38,7 @@ CONVERGENCE_LOSS     = 0.01       # absolute loss threshold
 CONVERGENCE_PLATEAU  = 5          # rounds with < this % improvement → converged
 PLATEAU_TOLERANCE    = 0.005      # minimum relative improvement to not count as plateau
 MAX_ROUNDS           = 5     # hard cap
-INFERENCE_COOLDOWN_S = 900        # 15 minutes between FL cycles
+INFERENCE_COOLDOWN_S = 420        # 7 minutes between FL cycles
 
 # ─── State ─────────────────────────────────────────────────────────────────────
 lock = threading.Lock()
@@ -168,9 +168,10 @@ def start_next_round():
 
 def aggregate_round():
     """Run FedAvg, check convergence, advance state."""
-    print(f"[Round {state.round_number}] Aggregating {len(state.round_updates)} updates …")
-    state.global_weights = federated_average(state.round_updates)
-    state.phase = "aggregating"
+    with lock:
+        print(f"[Round {state.round_number}] Aggregating {len(state.round_updates)} updates …")
+        state.global_weights = federated_average(state.round_updates)
+        state.phase = "aggregating"
 
     # Compute average round loss from all clients' reported losses
     all_losses = []
@@ -190,20 +191,21 @@ def aggregate_round():
 
     save_plots()
 
-    converged, reason = check_convergence()
-    if converged or state.round_number >= MAX_ROUNDS:
-        reason = reason or f"reached max rounds ({MAX_ROUNDS})"
-        print(f"\n✓ FL Converged! Reason: {reason}")
-        print(f"  Final global round: {state.round_number}")
+    with lock:
+        converged, reason = check_convergence()
+        if converged or state.round_number >= MAX_ROUNDS:
+            reason = reason or f"reached max rounds ({MAX_ROUNDS})"
+            print(f"\n✓ FL Converged! Reason: {reason}")
+            print(f"  Final global round: {state.round_number}")
 
-        # Verify weights identical across server record (clients will confirm on their end)
-        print(f"  [Integrity] Global weights hash: {hash(str(state.global_weights))}")
+            # Verify weights identical across server record (clients will confirm on their end)
+            print(f"  [Integrity] Global weights hash: {hash(str(state.global_weights))}")
 
-        state.phase         = "converged"
-        state.cooldown_start = None   # inference mode indefinitely until next cycle
-    else:
-        # Start next round immediately
-        start_next_round()
+            state.phase         = "converged"
+            state.cooldown_start = None   # inference mode indefinitely until next cycle
+        else:
+            # Start next round immediately
+            start_next_round()
 
 # ─── Registration ──────────────────────────────────────────────────────────────
 
@@ -266,10 +268,10 @@ def status():
             response["instruction"] = "inference"
             response["weights"]     = state.global_weights
             response["message"]     = "FL converged. Switch to inference mode."
-            # After clients acknowledge, start cooldown
-            if state.cooldown_start is None:
-                state.cooldown_start = time.time()
-                print(f"[FL] Cooldown started — next cycle in {INFERENCE_COOLDOWN_S}s")
+            # Transition to cooldown phase
+            state.cooldown_start = time.time()
+            state.phase = "cooldown"
+            print(f"[FL] Cooldown started — next cycle in {INFERENCE_COOLDOWN_S}s")
 
         elif state.phase == "cooldown":
             elapsed = time.time() - (state.cooldown_start or time.time())
@@ -281,7 +283,7 @@ def status():
                 state.cycle_number  += 1
                 state.plateau_count  = 0
                 state.history_loss   = []
-                state.global_weights = init_weights()
+                # Keep existing global weights — continue from converged model
                 start_next_round()
                 response["instruction"] = "train" if client_id == state.training_order[0] else "wait"
 
@@ -313,6 +315,12 @@ def receive_update():
         flat.extend(layer if isinstance(layer, list) else [layer])
     if len(flat) != TOTAL_WEIGHTS:
         return jsonify({"error": f"wrong weight count: {len(flat)}"}), 400
+    
+    # Validate no NaN/Inf in weights
+    import math
+    for w in flat:
+        if math.isnan(w) or math.isinf(w):
+            return jsonify({"error": "weights contain NaN or Inf values"}), 400
     
     # Reshape flat weights to nested [W1, b1, W2, b2, W3, b3] format
     flat_arr = np.array(flat, dtype=float)

@@ -36,12 +36,12 @@ static const char *TAG = "FL_CLIENT";
 #define WIFI_PASS      "curedata4low"
 #define SERVER_IP      "10.219.84.92"
 #define SERVER_PORT    5000
-#define CLIENT_ID      "esp32-node-B"
+#define CLIENT_ID      "esp32-node-A"
 
 #define POLL_INTERVAL_MS      3000
 #define INFERENCE_INTERVAL_MS 500
 #define SAMPLE_INTERVAL_MS    200
-#define LOCAL_SAMPLES_PER_CLASS 30
+#define LOCAL_SAMPLES_PER_CLASS 40
 #define LOCAL_EPOCHS          10
 #define LEARNING_RATE         0.01f
 #define ACTIVE_CLASSES        4
@@ -423,40 +423,52 @@ int infer_tflite(const float* x) {
     return best;
 }
 
-// ── SGD step (same as training.h) ────────────────────────────────────────────
+// ── SGD step with gradient clipping ──────────────────────────────────────────
+#define GRAD_CLIP 1.0f
+
+inline float clip_grad(float g) {
+    if (g > GRAD_CLIP) return GRAD_CLIP;
+    if (g < -GRAD_CLIP) return -GRAD_CLIP;
+    return g;
+}
+
 void sgd_step(const float* x, const float* one_hot_label) {
     float h1[HIDDEN1], h2[HIDDEN2], out[OUTPUT_DIM];
     forward_manual(x, h1, h2, out);
     
     float dout[OUTPUT_DIM];
     for (int j = 0; j < OUTPUT_DIM; j++)
-        dout[j] = out[j] - one_hot_label[j];
+        dout[j] = clip_grad(out[j] - one_hot_label[j]);
     
     float dh2[HIDDEN2] = {};
     for (int i = 0; i < HIDDEN2; i++) {
         for (int j = 0; j < OUTPUT_DIM; j++) {
-            W3[i][j] -= LEARNING_RATE * dout[j] * h2[i];
+            float grad = clip_grad(dout[j] * h2[i]);
+            W3[i][j] -= LEARNING_RATE * grad;
             dh2[i] += dout[j] * W3[i][j];
         }
     }
     for (int j = 0; j < OUTPUT_DIM; j++) b3[j] -= LEARNING_RATE * dout[j];
     
-    for (int i = 0; i < HIDDEN2; i++) dh2[i] = (h2[i] > 0.0f) ? dh2[i] : 0.0f;
+    for (int i = 0; i < HIDDEN2; i++) dh2[i] = (h2[i] > 0.0f) ? clip_grad(dh2[i]) : 0.0f;
     
     float dh1[HIDDEN1] = {};
     for (int i = 0; i < HIDDEN1; i++) {
         for (int j = 0; j < HIDDEN2; j++) {
-            W2[i][j] -= LEARNING_RATE * dh2[j] * h1[i];
+            float grad = clip_grad(dh2[j] * h1[i]);
+            W2[i][j] -= LEARNING_RATE * grad;
             dh1[i] += dh2[j] * W2[i][j];
         }
     }
     for (int j = 0; j < HIDDEN2; j++) b2[j] -= LEARNING_RATE * dh2[j];
     
-    for (int i = 0; i < HIDDEN1; i++) dh1[i] = (h1[i] > 0.0f) ? dh1[i] : 0.0f;
+    for (int i = 0; i < HIDDEN1; i++) dh1[i] = (h1[i] > 0.0f) ? clip_grad(dh1[i]) : 0.0f;
     
     for (int i = 0; i < INPUT_DIM; i++)
-        for (int j = 0; j < HIDDEN1; j++)
-            W1[i][j] -= LEARNING_RATE * dh1[j] * x[i];
+        for (int j = 0; j < HIDDEN1; j++) {
+            float grad = clip_grad(dh1[j] * x[i]);
+            W1[i][j] -= LEARNING_RATE * grad;
+        }
     for (int j = 0; j < HIDDEN1; j++) b1[j] -= LEARNING_RATE * dh1[j];
 }
 
@@ -643,7 +655,10 @@ bool pollStatus(float* weights_out, int* round_out, char* instruction, int instr
     // Extract weights
     if (weights_out && strstr(response, "\"weights\"")) {
         int dummy = 0;
-        parseWeightsFromJson(response, weights_out, dummy);
+        if (!parseWeightsFromJson(response, weights_out, dummy)) {
+            ESP_LOGE(TAG, "Failed to parse weights from status response");
+            return false;
+        }
     }
     
     return true;
@@ -812,7 +827,7 @@ bool initTFLite() {
     tflite_input = tflite_interpreter->input(0);
     tflite_output = tflite_interpreter->output(0);
     
-    ESP_LOGI(TAG, "TFLite initialized");
+    ESP_LOGI(TAG, "TFLite model initialized successfully (%d bytes)", tflite_model_size);
     tflite_initialized = true;
     return true;
 }
@@ -887,7 +902,24 @@ void runLocalTraining() {
         if (infer_manual(samples[t]) == labels[t]) correct++;
     ESP_LOGI(TAG, "Training accuracy: %d/%d (%.1f%%)", correct, TOTAL_SAMPLES, 100.0f * correct / TOTAL_SAMPLES);
     
-    // 6. Upload weights
+    // 6. Check for NaN weights before uploading
+    bool has_nan = false;
+    float flat[TOTAL_WEIGHTS];
+    flattenWeights(flat);
+    for (int i = 0; i < TOTAL_WEIGHTS; i++) {
+        if (isnan(flat[i]) || isinf(flat[i])) {
+            has_nan = true;
+            break;
+        }
+    }
+    
+    if (has_nan) {
+        ESP_LOGE(TAG, "NaN/Inf detected in weights — skipping upload");
+        ESP_LOGI(TAG, "Training complete (weights corrupted)");
+        return;
+    }
+    
+    // 7. Upload weights
     uploadWeights(TOTAL_SAMPLES);
     ESP_LOGI(TAG, "Training complete");
 }
@@ -980,6 +1012,7 @@ void fl_task(void *pvParameters) {
                     ESP_LOGI(TAG, "INFERENCE MODE");
                     unflattenWeights(weights);
                     currentRound = serverRound;
+                    ESP_LOGI(TAG, "Manual weights loaded successfully (round %d)", currentRound);
                     verifyWeightsWithServer();
                     clientPhase = PHASE_INFERENCE;
                 } else {
@@ -1006,7 +1039,9 @@ void fl_task(void *pvParameters) {
                     char instruction[32];
                     pollStatus(NULL, NULL, instruction, sizeof(instruction));
                     if (strcmp(instruction, "train") == 0) {
-                        ESP_LOGI(TAG, "New cycle — returning to IDLE");
+                        ESP_LOGI(TAG, "New cycle detected — resetting TFLite model");
+                        tflite_model_downloaded = false;
+                        tflite_initialized = false;
                         clientPhase = PHASE_IDLE;
                     }
                 }
