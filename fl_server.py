@@ -82,6 +82,7 @@ class FLState:
         self.round_losses        = {}        # client_id → list of per-epoch losses this round
 
         self.history_loss        = []        # avg loss per round (for convergence & plot)
+        self.all_history_loss    = []        # cumulative loss across all cycles
         self.plateau_count       = 0
         self.cooldown_start      = None
         self.cycle_number        = 0
@@ -136,23 +137,29 @@ def check_convergence():
     return False, ""
 
 def save_plots():
-    """Save per-round loss plot."""
-    if not state.history_loss:
+    """Save cumulative loss plot across all cycles."""
+    # Combine all_history_loss (past cycles) + history_loss (current cycle)
+    full_history = state.all_history_loss + state.history_loss
+    if not full_history:
         return
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(range(1, len(state.history_loss) + 1), state.history_loss,
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(range(1, len(full_history) + 1), full_history,
             marker='o', linewidth=2, color='#2563eb')
     ax.axhline(CONVERGENCE_LOSS, color='#dc2626', linestyle='--', label=f'Threshold ({CONVERGENCE_LOSS})')
-    ax.set_xlabel("FL Round")
+    
+    # Draw cycle boundaries
+    if len(state.all_history_loss) > 0:
+        ax.axvline(len(state.all_history_loss), color='#10b981', linestyle=':', alpha=0.7, label='Cycle boundary')
+    
+    ax.set_xlabel("FL Round (cumulative)")
     ax.set_ylabel("Average Loss")
-    ax.set_title(f"Federated Learning — Cycle {state.cycle_number} Convergence")
+    ax.set_title(f"Federated Learning — Convergence (Cycle {state.cycle_number})")
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    path = f"fl_loss_cycle{state.cycle_number}.png"
-    plt.savefig(path, dpi=120)
+    plt.savefig("fl_loss_cumulative.png", dpi=120)
     plt.close()
-    print(f"[FL] Loss plot saved → {path}")
+    print(f"[FL] Loss plot saved → fl_loss_cumulative.png ({len(full_history)} points)")
 
 def start_next_round():
     """Kick off a new round: shuffle training order, point to first trainer."""
@@ -277,9 +284,14 @@ def status():
             elapsed = time.time() - (state.cooldown_start or time.time())
             remaining = max(0, INFERENCE_COOLDOWN_S - elapsed)
             response["instruction"] = "inference"
+            response["weights"]     = state.global_weights
             response["cooldown_remaining_s"] = int(remaining)
             if remaining <= 0:
                 print(f"\n[FL] Cooldown complete — starting cycle {state.cycle_number + 1}")
+                # Save cumulative history before clearing
+                state.all_history_loss.extend(state.history_loss)
+                # Regenerate cumulative plot with cycle boundary
+                save_plots()
                 state.cycle_number  += 1
                 state.plateau_count  = 0
                 state.history_loss   = []
@@ -384,8 +396,20 @@ def verify_weights():
     weights   = data.get("weights", [])
 
     with lock:
-        match = weights_are_equal(state.global_weights, weights)
+        # Flatten server weights for comparison (client sends flattened)
+        server_flat = []
+        for layer in state.global_weights:
+            server_flat.extend(np.array(layer).flatten().tolist())
+        client_flat = []
+        for w in weights:
+            client_flat.extend(np.array(w).flatten().tolist()) if isinstance(w, list) else client_flat.append(float(w))
+        match = len(server_flat) == len(client_flat) and all(abs(a - b) < 1e-5 for a, b in zip(server_flat, client_flat))
         print(f"[FL] Weight verification — {client_id}: {'✓ MATCH' if match else '✗ MISMATCH'}")
+        if not match:
+            print(f"[FL]   Server len={len(server_flat)}, Client len={len(client_flat)}")
+            if len(client_flat) > 0:
+                print(f"[FL]   Server first 5: {server_flat[:5]}")
+                print(f"[FL]   Client first 5: {client_flat[:5]}")
 
     return jsonify({"match": match, "client_id": client_id})
 
@@ -445,6 +469,7 @@ def dashboard():
                                       state.current_trainer_idx < len(state.training_order)
                                    else None),
             "history_loss":       state.history_loss,
+            "all_history_loss":   state.all_history_loss,
             "plateau_count":      state.plateau_count,
             "min_clients":        MIN_CLIENTS,
             "total_weights":      TOTAL_WEIGHTS,

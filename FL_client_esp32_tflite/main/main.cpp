@@ -654,18 +654,19 @@ bool httpRegister() {
 }
 
 // ── Poll status ───────────────────────────────────────────────────────────────
+static char poll_response[HTTP_RESPONSE_MAX] __attribute__((aligned(4)));
+
 bool pollStatus(float* weights_out, int* round_out, char* instruction, int instr_max) {
     char url[256];
     snprintf(url, sizeof(url), "%s?client_id=%s", serverUrl("/status"), CLIENT_ID);
     
-    char response[HTTP_RESPONSE_MAX];
-    if (!httpGet(url, response, sizeof(response))) {
+    if (!httpGet(url, poll_response, sizeof(poll_response))) {
         strncpy(instruction, "wait", instr_max);
         return false;
     }
     
     // Extract instruction
-    const char* ii = strstr(response, "\"instruction\":\"");
+    const char* ii = strstr(poll_response, "\"instruction\":\"");
     if (!ii) {
         strncpy(instruction, "wait", instr_max);
         return false;
@@ -683,14 +684,14 @@ bool pollStatus(float* weights_out, int* round_out, char* instruction, int instr
     
     // Extract round
     if (round_out) {
-        const char* ri = strstr(response, "\"round\":");
+        const char* ri = strstr(poll_response, "\"round\":");
         if (ri) *round_out = atoi(ri + 8);
     }
     
     // Extract weights
-    if (weights_out && strstr(response, "\"weights\"")) {
+    if (weights_out && strstr(poll_response, "\"weights\"")) {
         int dummy = 0;
-        if (!parseWeightsFromJson(response, weights_out, dummy)) {
+        if (!parseWeightsFromJson(poll_response, weights_out, dummy)) {
             ESP_LOGE(TAG, "Failed to parse weights from status response");
             return false;
         }
@@ -700,16 +701,17 @@ bool pollStatus(float* weights_out, int* round_out, char* instruction, int instr
 }
 
 // ── Download model ────────────────────────────────────────────────────────────
+static char model_response[HTTP_RESPONSE_MAX] __attribute__((aligned(4)));
+
 bool downloadModel() {
-    char response[HTTP_RESPONSE_MAX];
-    if (!httpGet(serverUrl("/model"), response, sizeof(response))) {
+    if (!httpGet(serverUrl("/model"), model_response, sizeof(model_response))) {
         ESP_LOGW(TAG, "Model download failed — using local weights");
         return false;
     }
     
     float flat[TOTAL_WEIGHTS];
     int round = 0;
-    if (parseWeightsFromJson(response, flat, round)) {
+    if (parseWeightsFromJson(model_response, flat, round)) {
         unflattenWeights(flat);
         currentRound = round;
         ESP_LOGI(TAG, "Model downloaded (round %d)", currentRound);
@@ -720,9 +722,10 @@ bool downloadModel() {
 }
 
 // ── Upload weights ────────────────────────────────────────────────────────────
+static float upload_flat[TOTAL_WEIGHTS] __attribute__((aligned(4)));
+
 bool uploadWeights(int n_samples) {
-    float flat[TOTAL_WEIGHTS];
-    flattenWeights(flat);
+    flattenWeights(upload_flat);
     
     // Build JSON body
     SimpleString body(4096);
@@ -739,7 +742,7 @@ bool uploadWeights(int n_samples) {
     }
     body.append("],\"weights\":[");
     for (int i = 0; i < TOTAL_WEIGHTS; i++) {
-        body.append(flat[i], 6);
+        body.append(upload_flat[i], 6);
         if (i < TOTAL_WEIGHTS - 1) body.append(",");
     }
     body.append("]}");
@@ -756,27 +759,28 @@ bool uploadWeights(int n_samples) {
 }
 
 // ── Verify weights ────────────────────────────────────────────────────────────
+static float verify_flat[TOTAL_WEIGHTS] __attribute__((aligned(4)));
+static char verify_response[256] __attribute__((aligned(4)));
+
 void verifyWeightsWithServer() {
     ESP_LOGI(TAG, "Verifying weights...");
     
-    float flat[TOTAL_WEIGHTS];
-    flattenWeights(flat);
+    flattenWeights(verify_flat);
     
     SimpleString body(4096);
     body.append("{\"client_id\":\"");
     body.append(CLIENT_ID);
     body.append("\",\"weights\":[");
     for (int i = 0; i < TOTAL_WEIGHTS; i++) {
-        body.append(flat[i], 6);
+        body.append(verify_flat[i], 6);
         if (i < TOTAL_WEIGHTS - 1) body.append(",");
     }
     body.append("]}");
     
-    char response[256];
-    int status = httpPost(serverUrl("/verify_weights"), body.data, response, sizeof(response));
+    int status = httpPost(serverUrl("/verify_weights"), body.data, verify_response, sizeof(verify_response));
     
     if (status == 200) {
-        bool matched = strstr(response, "\"match\":true") != NULL;
+        bool matched = strstr(verify_response, "\"match\":true") != NULL;
         ESP_LOGI(TAG, "Verification: %s", matched ? "PASSED" : "FAILED");
     }
 }
@@ -1027,9 +1031,9 @@ void runInference() {
 
 // ── Network Task (HTTP + State Machine) ──────────────────────────────────────
 // Use static buffers to avoid stack overflow
-static float net_weights[TOTAL_WEIGHTS];
-static Command net_cmd;
-static WeightUpdate net_update;
+static float net_weights[TOTAL_WEIGHTS] __attribute__((aligned(4)));
+static Command net_cmd __attribute__((aligned(4)));
+static WeightUpdate net_update __attribute__((aligned(4)));
 
 void network_task(void *pvParameters) {
     // 1. Register with server
@@ -1044,10 +1048,14 @@ void network_task(void *pvParameters) {
     ESP_LOGI(TAG, "Network task: Registered!");
     
     // 2. Main loop - poll status and manage state
+    bool in_inference = false;
     while (1) {
         // Log stack and heap status
         UBaseType_t stack_remaining = uxTaskGetStackHighWaterMark(NULL);
-        ESP_LOGI(TAG, "Network task stack: %lu bytes", stack_remaining * sizeof(StackType_t));
+        ESP_LOGI(TAG, "Network stack: %lu/%d bytes (%lu%% free) | Heap: %lu bytes",
+                 stack_remaining * sizeof(StackType_t), 8192,
+                 (stack_remaining * sizeof(StackType_t) * 100) / 8192,
+                 esp_get_free_heap_size());
         
         // Poll status from server
         char instruction[32];
@@ -1057,6 +1065,10 @@ void network_task(void *pvParameters) {
         ESP_LOGI(TAG, "Network: %s round=%d", instruction, serverRound);
         
         if (strcmp(instruction, "train") == 0) {
+            // If inference task was running, notify it to reset
+            xTaskNotify(inference_task_handle, 1, eSetValueWithOverwrite);
+            in_inference = false;
+            
             // Send train command to training task
             net_cmd.type = CMD_TRAIN;
             net_cmd.round = serverRound;
@@ -1068,6 +1080,9 @@ void network_task(void *pvParameters) {
                 // Wait for weight update from training task
                 if (xQueueReceive(weight_queue, &net_update, pdMS_TO_TICKS(120000))) {
                     ESP_LOGI(TAG, "Network: Received weights from training task");
+                    
+                    // Copy epoch losses from training task to global array
+                    memcpy(epochLosses, net_update.epoch_losses, sizeof(epochLosses));
                     
                     // Upload weights to server
                     xSemaphoreTake(weight_mutex, portMAX_DELAY);
@@ -1087,10 +1102,19 @@ void network_task(void *pvParameters) {
             currentRound = serverRound;
             xSemaphoreGive(weight_mutex);
             
-            ESP_LOGI(TAG, "Network: Loaded inference weights (round %d)", serverRound);
-            
-            // Notify inference task to start
-            xTaskNotify(inference_task_handle, 0, eNoAction);
+            // Only verify and notify once when entering inference
+            if (!in_inference) {
+                ESP_LOGI(TAG, "Network: Loaded inference weights (round %d)", serverRound);
+                
+                // Verify weights match server
+                xSemaphoreTake(weight_mutex, portMAX_DELAY);
+                verifyWeightsWithServer();
+                xSemaphoreGive(weight_mutex);
+                
+                // Notify inference task to start
+                xTaskNotify(inference_task_handle, 0, eNoAction);
+                in_inference = true;
+            }
             
         } else {
             // "wait" - poll again after interval
@@ -1103,17 +1127,25 @@ void network_task(void *pvParameters) {
 
 // ── Training Task ────────────────────────────────────────────────────────────
 // Use static buffers to avoid stack overflow
-static Command train_cmd;
-static WeightUpdate train_update;
-static float train_samples[ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS][INPUT_DIM];
-static int train_labels[ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS];
-static float train_epoch_losses[LOCAL_EPOCHS];
+static Command train_cmd __attribute__((aligned(4)));
+static WeightUpdate train_update __attribute__((aligned(4)));
+static float train_samples[ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS][INPUT_DIM] __attribute__((aligned(4)));
+static int train_labels[ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS] __attribute__((aligned(4)));
+static float train_epoch_losses[LOCAL_EPOCHS] __attribute__((aligned(4)));
 
 void training_task(void *pvParameters) {
     while (1) {
         // Wait for train command from network task
         if (xQueueReceive(command_queue, &train_cmd, portMAX_DELAY) == pdTRUE) {
+            int64_t train_start = esp_timer_get_time();
             ESP_LOGI(TAG, "Training task: Received train command (round %d)", train_cmd.round);
+            
+            // Log task metrics at start
+            UBaseType_t stack_start = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "Training stack: %lu/%d bytes (%lu%% free) | Heap: %lu bytes",
+                     stack_start * sizeof(StackType_t), 8192,
+                     (stack_start * sizeof(StackType_t) * 100) / 8192,
+                     esp_get_free_heap_size());
             
             // Load weights from command
             xSemaphoreTake(weight_mutex, portMAX_DELAY);
@@ -1210,6 +1242,15 @@ void training_task(void *pvParameters) {
             } else {
                 ESP_LOGW(TAG, "Training task: Failed to send weight update");
             }
+            
+            // Log final training metrics
+            int64_t train_end = esp_timer_get_time();
+            UBaseType_t stack_end = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "Training complete | Total: %lld ms | Stack: %lu/%d bytes (%lu%% free) | Heap: %lu bytes",
+                     (long long)(train_end - train_start) / 1000,
+                     stack_end * sizeof(StackType_t), 8192,
+                     (stack_end * sizeof(StackType_t) * 100) / 8192,
+                     esp_get_free_heap_size());
         }
     }
 }
@@ -1222,44 +1263,84 @@ void inference_task(void *pvParameters) {
     ESP_LOGI(TAG, "Inference task: Starting inference");
     
     while (1) {
-        // Read sensor
+        // Try to download TFLite model if not done yet
+        if (!tflite_model_downloaded) {
+            ESP_LOGI(TAG, "Inference task: Downloading TFLite model...");
+            if (downloadTFLiteModel()) {
+                initTFLite();
+            }
+        }
+        
+        // Read sensor (no mutex needed for sensor read)
         float x[INPUT_DIM];
         if (!read_sensors(x)) {
             vTaskDelay(pdMS_TO_TICKS(INFERENCE_INTERVAL_MS));
             continue;
         }
         
-        float h1[HIDDEN1], h2[HIDDEN2], out_tflite[OUTPUT_DIM], out_manual[OUTPUT_DIM];
+        float out_tflite[OUTPUT_DIM], out_manual[OUTPUT_DIM];
+        float h1[HIDDEN1], h2[HIDDEN2];
         
-        // TFLite inference with metrics
-        xSemaphoreTake(tflite_mutex, portMAX_DELAY);
+        // TFLite inference with full metrics
+        xSemaphoreTake(tflite_mutex, 0);
         if (tflite_initialized) {
+            uint32_t heap_before = esp_get_free_heap_size();
             int64_t t0 = esp_timer_get_time();
+            
             forward_tflite(x, h1, h2, out_tflite);
+            
             int64_t t1 = esp_timer_get_time();
+            uint32_t heap_after = esp_get_free_heap_size();
             
             int pred_tflite = 0;
             for (int j = 1; j < OUTPUT_DIM; j++)
                 if (out_tflite[j] > out_tflite[pred_tflite]) pred_tflite = j;
             
-            ESP_LOGI(TAG, "[TFLite] %s (%.1f%%) | %lld us", 
-                     CLASS_NAMES[pred_tflite], 100.0f * out_tflite[pred_tflite], t1 - t0);
+            ESP_LOGI(TAG, "[TFLite] %s (%.1f%%) [%.3f %.3f %.3f %.3f] | %lld us | heap=%lu bytes",
+                     CLASS_NAMES[pred_tflite], 100.0f * out_tflite[pred_tflite],
+                     out_tflite[0], out_tflite[1], out_tflite[2], out_tflite[3],
+                     (long long)(t1 - t0), (unsigned long)heap_after);
         }
         xSemaphoreGive(tflite_mutex);
         
-        // Manual inference with metrics
-        xSemaphoreTake(weight_mutex, portMAX_DELAY);
-        int64_t t0 = esp_timer_get_time();
-        forward_manual(x, h1, h2, out_manual);
-        int64_t t1 = esp_timer_get_time();
-        xSemaphoreGive(weight_mutex);
+        // Manual inference (try to get mutex, skip if held by training)
+        if (xSemaphoreTake(weight_mutex, 0) == pdTRUE) {
+            uint32_t heap_before = esp_get_free_heap_size();
+            int64_t t0 = esp_timer_get_time();
+            
+            forward_manual(x, h1, h2, out_manual);
+            
+            int64_t t1 = esp_timer_get_time();
+            uint32_t heap_after = esp_get_free_heap_size();
+            xSemaphoreGive(weight_mutex);
+            
+            int pred_manual = 0;
+            for (int j = 1; j < OUTPUT_DIM; j++)
+                if (out_manual[j] > out_manual[pred_manual]) pred_manual = j;
+            
+            ESP_LOGI(TAG, "[Manual] %s (%.1f%%) [%.3f %.3f %.3f %.3f] | %lld us | heap=%lu bytes",
+                     CLASS_NAMES[pred_manual], 100.0f * out_manual[pred_manual],
+                     out_manual[0], out_manual[1], out_manual[2], out_manual[3],
+                     (long long)(t1 - t0), (unsigned long)heap_after);
+        }
         
-        int pred_manual = 0;
-        for (int j = 1; j < OUTPUT_DIM; j++)
-            if (out_manual[j] > out_manual[pred_manual]) pred_manual = j;
+        // Log inference task stack and system heap
+        UBaseType_t stack_remaining = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(TAG, "Inference stack: %lu/%d bytes (%lu%% free) | Heap: %lu bytes",
+                 stack_remaining * sizeof(StackType_t), 4096,
+                 (stack_remaining * sizeof(StackType_t) * 100) / 4096,
+                 esp_get_free_heap_size());
         
-        ESP_LOGI(TAG, "[Manual] %s (%.1f%%) | %lld us", 
-                 CLASS_NAMES[pred_manual], 100.0f * out_manual[pred_manual], t1 - t0);
+        // Check for notification (new cycle?)
+        uint32_t notified = 0;
+        xTaskNotifyWait(0, 0, &notified, 0);
+        if (notified == 1) {
+            ESP_LOGI(TAG, "Inference task: New cycle detected, resetting");
+            tflite_model_downloaded = false;
+            tflite_initialized = false;
+            // Re-enter waiting state
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
         
         vTaskDelay(pdMS_TO_TICKS(INFERENCE_INTERVAL_MS));
     }
