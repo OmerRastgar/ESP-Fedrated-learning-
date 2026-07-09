@@ -79,8 +79,20 @@ static bool tflite_model_downloaded = false;
 static uint8_t tflite_model_buffer[MAX_MODEL_SIZE];
 static size_t tflite_model_size = 0;
 
-// ── HTTP response buffer ──────────────────────────────────────────────────────
+// ── HTTP response buffers (per-task to avoid race conditions) ──────────────────
 #define HTTP_RESPONSE_MAX 8192
+
+// Network task has its own buffers
+static char net_http_response[HTTP_RESPONSE_MAX] __attribute__((aligned(4)));
+static char net_server_url[128];
+
+// Inference task has its own buffers
+static char inf_http_response[HTTP_RESPONSE_MAX] __attribute__((aligned(4)));
+static char inf_server_url[128];
+
+// Collect task has its own buffers
+static char col_http_response[512] __attribute__((aligned(4)));
+static char col_server_url[128];
 
 // ── WiFi event group ──────────────────────────────────────────────────────────
 static EventGroupHandle_t s_wifi_event_group;
@@ -110,10 +122,6 @@ QueueHandle_t result_queue = NULL;
 TaskHandle_t network_task_handle = NULL;
 TaskHandle_t collect_task_handle = NULL;
 TaskHandle_t inference_task_handle = NULL;
-
-// ── Sensor sample buffer (static, shared) ─────────────────────────────────────
-static float sensor_samples[ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS][INPUT_DIM] __attribute__((aligned(4)));
-static int sensor_labels[ACTIVE_CLASSES * LOCAL_SAMPLES_PER_CLASS] __attribute__((aligned(4)));
 
 // ── String helper (replaces Arduino String) ───────────────────────────────────
 class SimpleString {
@@ -275,16 +283,12 @@ bool read_sensors(float* out9) {
 }
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
-char server_url[128];
-
-const char* serverUrl(const char* path) {
-    snprintf(server_url, sizeof(server_url), "http://%s:%d%s", SERVER_IP, SERVER_PORT, path);
-    return server_url;
+const char* serverUrl(const char* path, char* url_buf, int buf_size, const char* ip, int port) {
+    snprintf(url_buf, buf_size, "http://%s:%d%s", ip, port, path);
+    return url_buf;
 }
 
 // ── HTTP GET helper ───────────────────────────────────────────────────────────
-static char http_response[HTTP_RESPONSE_MAX] __attribute__((aligned(4)));
-
 bool httpGet(const char* url, char* response, int max_len) {
     int64_t http_start = esp_timer_get_time();
     esp_http_client_config_t config = {};
@@ -398,8 +402,11 @@ bool uploadSensorData(const char* label, float samples[][INPUT_DIM], int num_sam
     }
     body.append("]}}");
     
+    char url[128];
+    serverUrl("/upload_data", url, sizeof(url), SERVER_IP, SERVER_PORT);
+    
     char response[512];
-    int status = httpPost(serverUrl("/upload_data"), body.data, response, sizeof(response));
+    int status = httpPost(url, body.data, response, sizeof(response));
     
     if (status == 200) {
         ESP_LOGI(TAG, "Upload OK: %s (%d samples)", label, num_samples);
@@ -412,14 +419,14 @@ bool uploadSensorData(const char* label, float samples[][INPUT_DIM], int num_sam
 // ── Poll server for status ────────────────────────────────────────────────────
 bool pollStatus(char* instruction, int instr_max) {
     char url[256];
-    snprintf(url, sizeof(url), "%s?client_id=%s", serverUrl("/status"), CLIENT_ID);
+    snprintf(url, sizeof(url), "http://%s:%d/status?client_id=%s", SERVER_IP, SERVER_PORT, CLIENT_ID);
     
-    if (!httpGet(url, http_response, sizeof(http_response))) {
+    if (!httpGet(url, net_http_response, sizeof(net_http_response))) {
         strncpy(instruction, "wait", instr_max);
         return false;
     }
     
-    const char* ii = strstr(http_response, "\"instruction\":\"");
+    const char* ii = strstr(net_http_response, "\"instruction\":\"");
     if (!ii) {
         strncpy(instruction, "wait", instr_max);
         return false;
@@ -708,28 +715,25 @@ void inference_task(void *pvParameters) {
         }
         
         // TFLite inference with full metrics
-        xSemaphoreTake(tflite_mutex, 0);
-        if (tflite_initialized) {
-            float out[OUTPUT_DIM];
-            
-            uint32_t heap_before = esp_get_free_heap_size();
-            int64_t t0 = esp_timer_get_time();
-            
-            forward_tflite(x, out);
-            
-            int64_t t1 = esp_timer_get_time();
-            uint32_t heap_after = esp_get_free_heap_size();
-            
-            int pred = 0;
-            for (int j = 1; j < OUTPUT_DIM; j++)
-                if (out[j] > out[pred]) pred = j;
-            
-            ESP_LOGI(TAG, "[TFLite] %s (%.1f%%) [%.3f %.3f %.3f %.3f] | %lld us | heap=%lu bytes",
-                     CLASS_NAMES[pred], 100.0f * out[pred],
-                     out[0], out[1], out[2], out[3],
-                     (long long)(t1 - t0), (unsigned long)heap_after);
+        if (xSemaphoreTake(tflite_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (tflite_initialized) {
+                float out[OUTPUT_DIM];
+                
+                int64_t t0 = esp_timer_get_time();
+                forward_tflite(x, out);
+                int64_t t1 = esp_timer_get_time();
+                
+                int pred = 0;
+                for (int j = 1; j < OUTPUT_DIM; j++)
+                    if (out[j] > out[pred]) pred = j;
+                
+                ESP_LOGI(TAG, "[TFLite] %s (%.1f%%) [%.3f %.3f %.3f %.3f] | %lld us | heap=%lu bytes",
+                         CLASS_NAMES[pred], 100.0f * out[pred],
+                         out[0], out[1], out[2], out[3],
+                         (long long)(t1 - t0), (unsigned long)esp_get_free_heap_size());
+            }
+            xSemaphoreGive(tflite_mutex);
         }
-        xSemaphoreGive(tflite_mutex);
         
         // Log inference task stack and system heap
         UBaseType_t stack_remaining = uxTaskGetStackHighWaterMark(NULL);
