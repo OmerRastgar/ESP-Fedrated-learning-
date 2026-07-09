@@ -371,24 +371,24 @@ int httpPost(const char* url, const char* body, char* response, int max_len) {
 bool uploadSensorData(const char* label, float samples[][INPUT_DIM], int num_samples) {
     SimpleString body(8192);
     
-    // Build EI-compatible JSON payload
-    // Server expects: {"label": "...", "payload": {"device_name": "...", ...}}
-    body.append("{\"label\":\"");
-    body.append(label);
-    body.append("\",\"payload\":{\"device_name\":\"");
+    // Build EI-compatible JSON payload matching test.py format
+    // Wrapped with protected/signature as required by EI ingestion API
+    body.append("{\"protected\":{\"ver\":\"v1\",\"alg\":\"none\",\"apiKey\":\"placeholder_handled_by_server\"},");
+    body.append("\"signature\":\"empty\",");
+    body.append("\"payload\":{\"device_name\":\"");
     body.append(CLIENT_ID);
     body.append("\",\"device_type\":\"ESP32-MPU6050\",\"interval_ms\":");
     body.append(SAMPLE_INTERVAL_MS);
     body.append(",\"sensors\":[");
-    body.append("{\"name\":\"accX\",\"units\":\"m/s2\"},");
-    body.append("{\"name\":\"accY\",\"units\":\"m/s2\"},");
-    body.append("{\"name\":\"accZ\",\"units\":\"m/s2\"},");
-    body.append("{\"name\":\"gyroX\",\"units\":\"deg/s\"},");
-    body.append("{\"name\":\"gyroY\",\"units\":\"deg/s\"},");
-    body.append("{\"name\":\"gyroZ\",\"units\":\"deg/s\"},");
-    body.append("{\"name\":\"r1\",\"units\":\"m/s2\"},");
-    body.append("{\"name\":\"r2\",\"units\":\"m/s2\"},");
-    body.append("{\"name\":\"r3\",\"units\":\"m/s2\"}");
+    body.append("{\"name\":\"ax\",\"units\":\"m/s2\"},");
+    body.append("{\"name\":\"ay\",\"units\":\"m/s2\"},");
+    body.append("{\"name\":\"az\",\"units\":\"m/s2\"},");
+    body.append("{\"name\":\"gx\",\"units\":\"deg/s\"},");
+    body.append("{\"name\":\"gy\",\"units\":\"deg/s\"},");
+    body.append("{\"name\":\"gz\",\"units\":\"deg/s\"},");
+    body.append("{\"name\":\"mx\",\"units\":\"uT\"},");
+    body.append("{\"name\":\"my\",\"units\":\"uT\"},");
+    body.append("{\"name\":\"mz\",\"units\":\"uT\"}");
     body.append("],\"values\":[");
     
     for (int i = 0; i < num_samples; i++) {
@@ -403,7 +403,7 @@ bool uploadSensorData(const char* label, float samples[][INPUT_DIM], int num_sam
     body.append("]}}");
     
     char url[128];
-    serverUrl("/upload-data", url, sizeof(url), SERVER_IP, SERVER_PORT);
+    snprintf(url, sizeof(url), "http://%s:%d/upload-data?label=%s", SERVER_IP, SERVER_PORT, label);
     
     char response[512];
     int status = httpPost(url, body.data, response, sizeof(response));
@@ -417,32 +417,54 @@ bool uploadSensorData(const char* label, float samples[][INPUT_DIM], int num_sam
 }
 
 // ── Poll server for status ────────────────────────────────────────────────────
-bool pollStatus(char* instruction, int instr_max) {
+bool pollStatus(bool* model_ready) {
     char url[256];
-    snprintf(url, sizeof(url), "http://%s:%d/status?client_id=%s", SERVER_IP, SERVER_PORT, CLIENT_ID);
+    snprintf(url, sizeof(url), "http://%s:%d/status", SERVER_IP, SERVER_PORT);
     
     if (!httpGet(url, net_http_response, sizeof(net_http_response))) {
-        strncpy(instruction, "wait", instr_max);
         return false;
     }
     
-    const char* ii = strstr(net_http_response, "\"instruction\":\"");
-    if (!ii) {
-        strncpy(instruction, "wait", instr_max);
-        return false;
+    // Parse model_available from response
+    const char* ma = strstr(net_http_response, "\"model_available\":");
+    if (ma) {
+        ma += 18; // skip key
+        while (*ma == ' ') ma++;
+        *model_ready = (strncmp(ma, "true", 4) == 0);
     }
-    const char* is = ii + 15;
-    const char* ie = strchr(is, '"');
-    if (!ie) {
-        strncpy(instruction, "wait", instr_max);
-        return false;
+    
+    // Parse building status
+    const char* bl = strstr(net_http_response, "\"building\":");
+    bool building = false;
+    if (bl) {
+        bl += 11;
+        while (*bl == ' ') bl++;
+        building = (strncmp(bl, "true", 4) == 0);
     }
-    int len = ie - is;
-    if (len >= instr_max) len = instr_max - 1;
-    memcpy(instruction, is, len);
-    instruction[len] = '\0';
+    
+    if (building) {
+        ESP_LOGI(TAG, "Status: Pipeline building...");
+    }
     
     return true;
+}
+
+// ── Trigger build-and-extract pipeline on server ──────────────────────────────
+bool triggerBuild() {
+    ESP_LOGI(TAG, "Triggering build-and-extract pipeline...");
+    
+    char url[128];
+    serverUrl("/build-and-extract", url, sizeof(url), SERVER_IP, SERVER_PORT);
+    
+    char response[512];
+    int status = httpPost(url, "", response, sizeof(response));
+    
+    if (status == 200) {
+        ESP_LOGI(TAG, "Build pipeline triggered successfully");
+        return true;
+    }
+    ESP_LOGW(TAG, "Build trigger failed HTTP %d — %s", status, response);
+    return false;
 }
 
 // ── Download TFLite model from local server ───────────────────────────────────
@@ -551,12 +573,18 @@ void forward_tflite(const float* x, float* out) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // NETWORK TASK — Core 0, Priority 5
 // Triggers collection, then polls for model availability
+// Auto-retrain after 3 minutes of inference
 // ═══════════════════════════════════════════════════════════════════════════════
+#define RETRAIN_INTERVAL_MS 180000  // 3 minutes
+
 void network_task(void *pvParameters) {
     ESP_LOGI(TAG, "Network task started");
     
     bool data_collected = false;
+    bool build_triggered = false;
     bool model_ready = false;
+    int64_t inference_start_time = 0;
+    int retrain_cycle = 0;
     
     while (1) {
         // Log stack and heap status
@@ -565,6 +593,26 @@ void network_task(void *pvParameters) {
                  stack_remaining * sizeof(StackType_t), 8192,
                  (stack_remaining * sizeof(StackType_t) * 100) / 8192,
                  esp_get_free_heap_size());
+        
+        // Check if it's time to retrain (after 3 minutes of inference)
+        if (model_ready && inference_start_time > 0) {
+            int64_t elapsed_ms = (esp_timer_get_time() - inference_start_time) / 1000;
+            if (elapsed_ms >= RETRAIN_INTERVAL_MS) {
+                retrain_cycle++;
+                ESP_LOGI(TAG, "=== RETRAIN CYCLE %d — Collecting new data ===", retrain_cycle);
+                
+                // Reset state for new training cycle
+                data_collected = false;
+                build_triggered = false;
+                model_ready = false;
+                inference_start_time = 0;
+                
+                // Stop inference task
+                xTaskNotify(inference_task_handle, 1, eSetValueWithOverwrite);
+                tflite_model_downloaded = false;
+                tflite_initialized = false;
+            }
+        }
         
         if (!data_collected) {
             // Phase 1: Trigger data collection
@@ -585,24 +633,46 @@ void network_task(void *pvParameters) {
                 }
             }
         }
-        else if (!model_ready) {
-            // Phase 2: Try to download model (poll until available)
-            ESP_LOGI(TAG, "Network: Checking for model...");
-            
-            if (downloadModelFromServer()) {
-                initTFLite();
-                model_ready = true;
-                
-                // Notify inference task to start
-                xTaskNotify(inference_task_handle, 0, eNoAction);
-                ESP_LOGI(TAG, "Network: Model ready, inference started");
+        else if (!build_triggered) {
+            // Phase 2: Trigger build-and-extract pipeline
+            ESP_LOGI(TAG, "Network: Triggering build pipeline...");
+            if (triggerBuild()) {
+                build_triggered = true;
+                ESP_LOGI(TAG, "Network: Build pipeline triggered, waiting 30s for training...");
+                vTaskDelay(pdMS_TO_TICKS(30000)); // Wait 30s before first poll
             } else {
-                ESP_LOGI(TAG, "Network: Model not available yet, retrying in %d s", POLL_INTERVAL_MS / 1000);
+                ESP_LOGW(TAG, "Network: Build trigger failed, retrying in 10s...");
+                vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10s on failure
             }
         }
+        else if (!model_ready) {
+            // Phase 3: Poll status until model is available
+            bool server_model_ready = false;
+            if (pollStatus(&server_model_ready)) {
+                if (server_model_ready) {
+                    ESP_LOGI(TAG, "Network: Model available, downloading...");
+                    if (downloadModelFromServer()) {
+                        initTFLite();
+                        model_ready = true;
+                        inference_start_time = esp_timer_get_time();
+                        
+                        // Notify inference task to start
+                        xTaskNotify(inference_task_handle, 0, eNoAction);
+                        ESP_LOGI(TAG, "Network: Model ready, inference started (will retrain in 3 min)");
+                    }
+                } else {
+                    ESP_LOGI(TAG, "Network: Waiting for model to be ready...");
+                }
+            }
+            // Poll every 15 seconds during build
+            vTaskDelay(pdMS_TO_TICKS(15000));
+            continue; // Skip the normal POLL_INTERVAL_MS delay
+        }
         else {
-            // Phase 3: Running — just log status
-            ESP_LOGI(TAG, "Network: Inference running");
+            // Phase 4: Running — log time remaining
+            int64_t elapsed_ms = (esp_timer_get_time() - inference_start_time) / 1000;
+            int remaining_s = (RETRAIN_INTERVAL_MS - elapsed_ms) / 1000;
+            ESP_LOGI(TAG, "Network: Inference running (retrain in %d s)", remaining_s);
         }
         
         vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));

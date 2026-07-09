@@ -1,8 +1,40 @@
+# Environment variables
+.env
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+dist/
 build/
-*.bin
-*.elf
-*.map
-.flbuildenvs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated files
+static_bin/
+*.tflite
+downloaded_test_model.tflite
+
+# ESP32 build artifacts
+FL_client_esp32_edgeimpulse/build/
+FL_client_esp32_tflite/build/
+FL_client_esp32/build/
+FL_client_esp32_V2/build/
+FL_client_esp32_modular/build/
+FL_client_esp8266/build/
 managed_components/
+dependencies.lock
+sdkconfig.old
