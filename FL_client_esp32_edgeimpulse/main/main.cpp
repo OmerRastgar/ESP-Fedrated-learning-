@@ -403,7 +403,7 @@ bool uploadSensorData(const char* label, float samples[][INPUT_DIM], int num_sam
     body.append("]}}");
     
     char url[128];
-    serverUrl("/upload_data", url, sizeof(url), SERVER_IP, SERVER_PORT);
+    serverUrl("/upload-data", url, sizeof(url), SERVER_IP, SERVER_PORT);
     
     char response[512];
     int status = httpPost(url, body.data, response, sizeof(response));
@@ -449,8 +449,11 @@ bool pollStatus(char* instruction, int instr_max) {
 bool downloadModelFromServer() {
     ESP_LOGI(TAG, "Downloading TFLite model from server...");
     
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/models/model.tflite", SERVER_IP, SERVER_PORT);
+    
     esp_http_client_config_t config = {};
-    config.url = serverUrl("/get_model");
+    config.url = url;
     config.timeout_ms = 10000;
     
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -547,12 +550,13 @@ void forward_tflite(const float* x, float* out) {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // NETWORK TASK — Core 0, Priority 5
-// Polls server for instructions, triggers collection/inference
+// Triggers collection, then polls for model availability
 // ═══════════════════════════════════════════════════════════════════════════════
 void network_task(void *pvParameters) {
     ESP_LOGI(TAG, "Network task started");
     
-    bool in_inference = false;
+    bool data_collected = false;
+    bool model_ready = false;
     
     while (1) {
         // Log stack and heap status
@@ -562,15 +566,10 @@ void network_task(void *pvParameters) {
                  (stack_remaining * sizeof(StackType_t) * 100) / 8192,
                  esp_get_free_heap_size());
         
-        // Poll server for status
-        char instruction[32];
-        pollStatus(instruction, sizeof(instruction));
-        ESP_LOGI(TAG, "Network: %s", instruction);
-        
-        if (strcmp(instruction, "train") == 0) {
-            in_inference = false;
+        if (!data_collected) {
+            // Phase 1: Trigger data collection
+            ESP_LOGI(TAG, "Network: Triggering data collection");
             
-            // Send collect command to collect task
             Command cmd;
             cmd.type = CMD_COLLECT;
             if (xQueueSend(command_queue, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -580,24 +579,30 @@ void network_task(void *pvParameters) {
                 CollectResult result;
                 if (xQueueReceive(result_queue, &result, pdMS_TO_TICKS(300000))) {
                     ESP_LOGI(TAG, "Network: Collection complete (%d samples)", result.n_samples);
+                    data_collected = true;
                 } else {
                     ESP_LOGW(TAG, "Network: Timeout waiting for collection");
                 }
             }
+        }
+        else if (!model_ready) {
+            // Phase 2: Try to download model (poll until available)
+            ESP_LOGI(TAG, "Network: Checking for model...");
             
-        } else if (strcmp(instruction, "inference") == 0) {
-            if (!in_inference) {
-                ESP_LOGI(TAG, "Network: Entering inference mode");
-                
-                // Download TFLite model
-                if (downloadModelFromServer()) {
-                    initTFLite();
-                }
+            if (downloadModelFromServer()) {
+                initTFLite();
+                model_ready = true;
                 
                 // Notify inference task to start
                 xTaskNotify(inference_task_handle, 0, eNoAction);
-                in_inference = true;
+                ESP_LOGI(TAG, "Network: Model ready, inference started");
+            } else {
+                ESP_LOGI(TAG, "Network: Model not available yet, retrying in %d s", POLL_INTERVAL_MS / 1000);
             }
+        }
+        else {
+            // Phase 3: Running — just log status
+            ESP_LOGI(TAG, "Network: Inference running");
         }
         
         vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
