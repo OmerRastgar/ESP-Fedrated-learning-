@@ -367,11 +367,13 @@ int httpPost(const char* url, const char* body, char* response, int max_len) {
 bool uploadSensorData(const char* label, float samples[][INPUT_DIM], int num_samples) {
     SimpleString body(8192);
     
-    body.append("{\"client_id\":\"");
-    body.append(CLIENT_ID);
-    body.append("\",\"label\":\"");
+    // Build EI-compatible JSON payload
+    // Server expects: {"label": "...", "payload": {"device_name": "...", ...}}
+    body.append("{\"label\":\"");
     body.append(label);
-    body.append("\",\"interval_ms\":");
+    body.append("\",\"payload\":{\"device_name\":\"");
+    body.append(CLIENT_ID);
+    body.append("\",\"device_type\":\"ESP32-MPU6050\",\"interval_ms\":");
     body.append(SAMPLE_INTERVAL_MS);
     body.append(",\"sensors\":[");
     body.append("{\"name\":\"accX\",\"units\":\"m/s2\"},");
@@ -394,7 +396,7 @@ bool uploadSensorData(const char* label, float samples[][INPUT_DIM], int num_sam
         body.append("]");
         if (i < num_samples - 1) body.append(",");
     }
-    body.append("]}");
+    body.append("]}}");
     
     char response[512];
     int status = httpPost(serverUrl("/upload_data"), body.data, response, sizeof(response));

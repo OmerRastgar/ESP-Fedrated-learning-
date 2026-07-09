@@ -19,8 +19,6 @@ Endpoints:
 import os
 import json
 import time
-import hmac
-import hashlib
 import zipfile
 import requests
 from flask import Flask, request, jsonify, send_file
@@ -30,9 +28,10 @@ app = Flask(__name__)
 
 # ── Edge Impulse Config ────────────────────────────────────────────────────────
 EI_API_KEY = "ei_fd83..."                    # Your EI project API key
-EI_HMAC_KEY = "fed53116..."                  # Your EI HMAC signing key
 EI_INGESTION_URL = "https://ingestion.edgeimpulse.com/api/training/data"
-EI_DEPLOYMENT_URL = "https://studio.edgeimpulse.com/api/v1/deployment/model"
+EI_BUILD_URL = "https://studio.edgeimpulse.com/v1/api/{projectId}/jobs/build-ondevice-model"
+EI_DEPLOYMENT_URL = "https://studio.edgeimpulse.com/v1/api/{projectId}/deployment/download"
+PROJECT_ID = 123456                          # Your EI project ID
 
 # ── Model storage ──────────────────────────────────────────────────────────────
 MODEL_DIR = "ei_models"
@@ -61,33 +60,17 @@ state = ServerState()
 # ── Ensure model directory exists ──────────────────────────────────────────────
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ── HMAC Signing ───────────────────────────────────────────────────────────────
-def sign_payload(data):
-    """Sign EI payload with HMAC-SHA256."""
-    data["signature"] = "0" * 64
-    
-    encoded = json.dumps(data)
-    
-    signature = hmac.new(
-        bytes(EI_HMAC_KEY, 'utf-8'),
-        msg=encoded.encode('utf-8'),
-        digestmod=hashlib.sha256
-    ).hexdigest()
-    
-    data["signature"] = signature
-    return json.dumps(data)
-
 # ── Forward data to Edge Impulse ───────────────────────────────────────────────
 def forward_to_ei(payload, label, device_name):
     """Forward sensor data to Edge Impulse ingestion API."""
-    # Build EI payload
+    # Build EI Data Acquisition Format (no HMAC required)
     ei_data = {
         "protected": {
             "ver": "v1",
-            "alg": "HS256",
+            "alg": "none",
             "iat": int(time.time())
         },
-        "signature": "0" * 64,
+        "signature": "00",
         "payload": {
             "device_name": device_name,
             "device_type": "ESP32-MPU6050",
@@ -97,21 +80,18 @@ def forward_to_ei(payload, label, device_name):
         }
     }
     
-    # Sign payload
-    signed_data = sign_payload(ei_data)
-    
     # Forward to EI
     headers = {
         "Content-Type": "application/json",
         "x-api-key": EI_API_KEY,
         "x-label": label,
-        "x-file-name": f"{device_name}_{label}_{int(time.time())}"
+        "x-file-name": f"{device_name}_{label}_{int(time.time())}.json"
     }
     
     try:
         response = requests.post(
             EI_INGESTION_URL,
-            data=signed_data,
+            json=ei_data,
             headers=headers,
             timeout=30
         )
@@ -219,23 +199,44 @@ def get_model():
         download_name='model.tflite'
     )
 
+@app.route("/trigger_training", methods=["POST"])
+def trigger_training():
+    """Trigger Edge Impulse to build an on-device TFLite model."""
+    url = EI_BUILD_URL.format(projectId=PROJECT_ID) + "?type=tflite"
+    headers = {
+        "x-api-key": EI_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "engine": "tflite",
+        "modelType": "int8"
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        if response.status_code == 200:
+            print("[Server] Training triggered successfully")
+            return jsonify({"status": "training_triggered", "response": response.json()})
+        else:
+            print(f"[Server] Training trigger failed: {response.status_code}")
+            return jsonify({"error": "Failed to trigger training", "status_code": response.status_code, "details": response.text}), response.status_code
+    except Exception as e:
+        print(f"[Server] Training trigger error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/poll_ei_model", methods=["POST"])
 def poll_ei_model():
     """Check Edge Impulse for new model, download and unzip."""
     print("[Server] Polling Edge Impulse for new model...")
     
+    url = EI_DEPLOYMENT_URL.format(projectId=PROJECT_ID) + "?type=tflite"
     headers = {
         "x-api-key": EI_API_KEY
     }
     
     try:
         # Check for model
-        response = requests.get(
-            EI_DEPLOYMENT_URL,
-            headers=headers,
-            params={"type": "tflite", "variant": "float32"},
-            timeout=30
-        )
+        response = requests.get(url, headers=headers, timeout=30)
         
         if response.status_code == 200:
             content_type = response.headers.get("Content-Type", "")
